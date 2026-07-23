@@ -1,14 +1,14 @@
 #OTN Note: NVDA's Q1 2027 10-Q was issued on April 26, 2026: https://www.sec.gov/ix?doc=/Archives/edgar/data/0001045810/000104581026000052/nvda-20260426.htm#fact-identifier-340.
-#I documented XBRL tags for each financial state within the bank_panel_NVDIA-BS.csv, bank_panel_NVDIA-IS.csv,bank_panel_NVDIA-SCF.csv,and bank_panel_NVDIA-SOE.csv files. For purposes of preparing the historical panels, this file only includes the income statement and balance sheet.
+#I documented XBRL tags for each financial state within the NVDA-BS.csv, NVDA-IS.csv.
 
 """
 xbrl_panel.py — Build a historical financial-statement panel from SEC XBRL
-company facts, driven by an FSLI -> XBRL tag mapping ("bank panel") CSV.
+company facts, driven by an FSLI -> XBRL tag mapping ("NVDA-BS") & ("NVDA-IS") CSV files.
 
 Inputs
 ------
-  bank_panel_-_<TICKER>-BS.csv   FSLI / XBRL Tag  (balance sheet, instant facts)
-  bank_panel_-_<TICKER>-IS.csv   FSLI / XBRL Tag  (income statement, duration facts)
+  NVDA-BS.csv   FSLI / XBRL Tag  (balance sheet, instant facts)
+  NVDA-IS.csv   FSLI / XBRL Tag  (income statement, duration facts)
 
 Output
 ------
@@ -37,8 +37,8 @@ Integrity checks
 Usage
 -----
   python xbrl_panel.py --cik 1045810 --ticker NVDA \
-      --bs "bank_panel_-_NVIDIA-BS.csv" --is "bank_panel_-_NVIDIA-IS.csv" \
-      --user-agent "Jane Doe jane@firm.com" --periods 12 --outdir ./out
+      --bs "NVDA-BS.csv" --is "NVDA-IS.csv" \
+      --user-agent "abc@xyz.com" --periods 12 --outdir ./out
 
   # no network — exercise the check engine against a local fixture
   python xbrl_panel.py --fixture fixture_companyfacts.json ...
