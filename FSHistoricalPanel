@@ -1,0 +1,768 @@
+Breakdown this Python script. It's an output from Claude, and I understand the outputs, but I'm making sure I understand the structure of the program. It's will be the basis of a three statement financial forecast that I'm building and would like your assistance with.  #!/usr/bin/env python3
+"""
+xbrl_panel.py — Build a historical financial-statement panel from SEC XBRL
+company facts, driven by an FSLI -> XBRL tag mapping ("bank panel") CSV.
+
+Inputs
+------
+  bank_panel_-_<TICKER>-BS.csv   FSLI / XBRL Tag  (balance sheet, instant facts)
+  bank_panel_-_<TICKER>-IS.csv   FSLI / XBRL Tag  (income statement, duration facts)
+
+Output
+------
+  panel_balance_sheet.csv        FSLI rows x period columns
+  panel_income_statement.csv     FSLI rows x period columns
+  check_results.csv              every integrity check, per period, pass/fail
+  facts_long.csv                 tidy long-format fact table (for Sheets/BI)
+
+Integrity checks
+----------------
+  BS01  Assets == LiabilitiesAndStockholdersEquity
+  BS02  Assets == Liabilities + StockholdersEquity
+  BS03  AssetsCurrent == sum(current asset components)
+  BS04  LiabilitiesCurrent == sum(current liability components)
+  BS05  StockholdersEquity == sum(equity components)
+  IS01  Revenues - CostOfRevenue == GrossProfit
+  IS02  GrossProfit - OperatingExpenses == OperatingIncomeLoss
+  IS03  OperatingIncomeLoss + NonoperatingIncomeExpense == PretaxIncome
+  IS04  PretaxIncome - IncomeTaxExpenseBenefit == NetIncomeLoss
+  IS05  NetIncomeLoss + OCI == ComprehensiveIncomeNetOfTax
+  EQ01  Equity rollforward:
+        SE(t-1) + NetIncome + OCI + StockIssuedNewIssues + ShareBasedComp
+              - TaxWithholdingOnShareBasedComp - ShareRepurchases - Dividends
+        == SE(t)
+
+Usage
+-----
+  python xbrl_panel.py --cik 1045810 --ticker NVDA \
+      --bs "bank_panel_-_NVIDIA-BS.csv" --is "bank_panel_-_NVIDIA-IS.csv" \
+      --user-agent "Jane Doe jane@firm.com" --periods 12 --outdir ./out
+
+  # no network — exercise the check engine against a local fixture
+  python xbrl_panel.py --fixture fixture_companyfacts.json ...
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from typing import Any, Iterable
+
+import pandas as pd
+
+try:
+    import requests
+except ImportError:  # offline/fixture mode does not need it
+    requests = None
+
+
+SEC_COMPANYFACTS = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
+
+# ---------------------------------------------------------------------------
+# Tolerances. SEC values are reported in whole units (USD), so ABS_TOL is in
+# dollars. A check passes if it is within EITHER tolerance.
+# ---------------------------------------------------------------------------
+ABS_TOL = 1_000_000.0     # $1MM — absorbs rounding in $-in-millions filers
+REL_TOL = 0.0025          # 25bps of the larger side
+
+
+# ===========================================================================
+# 1. Mapping ingestion
+# ===========================================================================
+
+TAG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]*:[A-Za-z][A-Za-z0-9_\-\.]*$")
+
+
+@dataclass
+class MappedLine:
+    order: int
+    fsli: str            # cleaned label
+    raw_fsli: str        # original, indentation preserved
+    tag: str             # "us-gaap:Assets"
+    concept: str         # "Assets"
+    taxonomy: str        # "us-gaap"
+    depth: int           # indentation level, from leading spaces
+    statement: str       # "BS" | "IS"
+
+
+def load_mapping(path: str, statement: str) -> list[MappedLine]:
+    """Read a bank-panel CSV. Header sits on row 3 (two blank spacer rows)."""
+    raw = pd.read_csv(path, header=None, dtype=str, keep_default_na=False)
+
+    # locate the header row rather than hardcoding index 2
+    hdr = None
+    for i in range(min(10, len(raw))):
+        row = [str(c).strip().lower() for c in raw.iloc[i].tolist()]
+        if "fsli" in row and any("xbrl" in c for c in row):
+            hdr = i
+            break
+    if hdr is None:
+        raise ValueError(f"{path}: could not locate 'FSLI' / 'XBRL Tag' header row")
+
+    body = raw.iloc[hdr + 1 :, :2]
+    body.columns = ["fsli", "tag"]
+
+    lines: list[MappedLine] = []
+    for i, (fsli, tag) in enumerate(body.itertuples(index=False, name=None)):
+        fsli = "" if fsli is None else str(fsli)
+        tag = "" if tag is None else str(tag).strip()
+        if not TAG_RE.match(tag):
+            # section headers, blank spacers, and the stray literal
+            # "Total Operating Expenses" placeholder are all skipped here
+            continue
+        depth = (len(fsli) - len(fsli.lstrip(" "))) // 5
+        clean = fsli.strip().lstrip("-").strip()
+        taxonomy, concept = tag.split(":", 1)
+        lines.append(
+            MappedLine(
+                order=i,
+                fsli=clean,
+                raw_fsli=fsli.rstrip(),
+                tag=tag,
+                concept=concept,
+                taxonomy=taxonomy,
+                depth=depth,
+                statement=statement,
+            )
+        )
+    if not lines:
+        raise ValueError(f"{path}: no valid XBRL tags found")
+    if len(lines) < 5:
+        # a near-empty parse means the file shape changed, not that the
+        # statement is genuinely 4 lines long — surface it loudly
+        print(f"WARNING: {path} yielded only {len(lines)} tagged lines; "
+              f"check the file layout.", file=sys.stderr)
+    return lines
+
+
+# ===========================================================================
+# 2. Tag fallback chains
+# ===========================================================================
+# A mapping sheet pins one tag per FSLI, but issuers migrate concepts across
+# years (NVIDIA moved off us-gaap:Revenues to the ASC 606 revenue concept, and
+# reports cost of revenue under either CostOfRevenue or CostOfGoodsAndServicesSold
+# depending on filing vintage). Without fallbacks, a panel silently shows blanks
+# for older or newer periods. Each primary concept maps to ordered alternates.
+
+FALLBACKS: dict[str, list[str]] = {
+    "Revenues": [
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "RevenueFromContractWithCustomerIncludingAssessedTax",
+        "SalesRevenueNet",
+    ],
+    "CostOfRevenue": [
+        "CostOfGoodsAndServicesSold",
+        "CostOfRevenueExcludingDepreciationDepletionAndAmortization",
+    ],
+    "DebtSecuritiesCurrent": [
+        "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
+        "MarketableSecuritiesCurrent",
+    ],
+    "EquitySecuritiesFvNi": ["EquitySecuritiesFvNiCurrentAndNoncurrent"],
+    "PrepaidExpenseAndOtherAssetsCurrent": ["OtherAssetsCurrent"],
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest": [
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+    ],
+    "DebtCurrent": ["LongTermDebtCurrent", "CommercialPaper"],
+    "PreferredStockValueOutstanding": ["PreferredStockValue"],
+    "IntangibleAssetsNetExcludingGoodwill": ["FiniteLivedIntangibleAssetsNet"],
+    "DeferredIncomeTaxAssetsNet": ["DeferredIncomeTaxAssetsNetNoncurrent"],
+    "WeightedAverageNumberOfDilutedSharesOutstanding": [
+        "WeightedAverageNumberOfDilutedSharesOutstandingBasicAndDiluted",
+    ],
+}
+
+# Concepts needed for the equity rollforward that do not appear on either
+# mapping sheet (they live on the cash flow / equity statements).
+ROLLFORWARD_CONCEPTS: dict[str, list[str]] = {
+    "NetIncomeLoss": ["ProfitLoss"],
+    "OtherComprehensiveIncomeLossNetOfTaxPortionAttributableToParent": [
+        "OtherComprehensiveIncomeLossNetOfTax"
+    ],
+    "StockIssuedDuringPeriodValueNewIssues": [
+        "ProceedsFromIssuanceOfCommonStock",
+        "StockIssuedDuringPeriodValueEmployeeStockPurchasePlan",
+        "ProceedsFromStockOptionsExercised",
+    ],
+    "ShareBasedCompensation": [
+        "AllocatedShareBasedCompensationExpense",
+        "ShareBasedCompensationArrangementByShareBasedPaymentAwardCompensationCost",
+    ],
+    "PaymentsRelatedToTaxWithholdingForShareBasedCompensation": [
+        "AdjustmentsRelatedToTaxWithholdingForShareBasedCompensation",
+        "StockRepurchasedDuringPeriodValue",
+    ],
+    "PaymentsForRepurchaseOfCommonStock": [
+        "TreasuryStockValueAcquiredCostMethod",
+        "StockRepurchasedAndRetiredDuringPeriodValue",
+    ],
+    "PaymentsOfDividendsCommonStock": [
+        "PaymentsOfDividends",
+        "DividendsCommonStockCash",
+    ],
+    "StockholdersEquity": ["StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+}
+
+
+def chain(concept: str) -> list[str]:
+    return [concept] + FALLBACKS.get(concept, []) + ROLLFORWARD_CONCEPTS.get(concept, [])
+
+
+# ===========================================================================
+# 3. SEC fetch
+# ===========================================================================
+
+def _get_json(url: str, headers: dict) -> tuple[int, dict | None]:
+    """One GET, returning (status_code, parsed_json_or_None).
+
+    Uses the stdlib so the script has no third-party HTTP dependency; if
+    requests happens to be installed it is used instead, purely for its
+    connection pooling on repeated runs.
+    """
+    if requests is not None:
+        r = requests.get(url, headers=headers, timeout=30)
+        return r.status_code, (r.json() if r.status_code == 200 else None)
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+            # urllib does not transparently decompress
+            if r.headers.get("Content-Encoding") == "gzip":
+                raw = gzip.decompress(raw)
+            return r.status, json.loads(raw.decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"network error reaching SEC: {e.reason}") from e
+
+
+def fetch_companyfacts(cik: int, user_agent: str, cache: str | None = None) -> dict:
+    """SEC requires a descriptive User-Agent and throttles at 10 req/sec."""
+    if cache and os.path.exists(cache):
+        with open(cache) as fh:
+            return json.load(fh)
+
+    url = SEC_COMPANYFACTS.format(cik=cik)
+    headers = {
+        "User-Agent": user_agent,
+        "Accept-Encoding": "gzip, deflate",
+        "Host": "data.sec.gov",
+    }
+
+    status = None
+    for attempt in range(4):
+        status, data = _get_json(url, headers)
+        if status == 200 and data is not None:
+            if cache:
+                with open(cache, "w") as fh:
+                    json.dump(data, fh)
+            return data
+        if status == 404:
+            raise RuntimeError(
+                f"SEC returned 404 for CIK {cik:010d}. Check the CIK is correct "
+                f"and has XBRL filings (NVIDIA = 1045810)."
+            )
+        if status in (403, 429, 503):
+            time.sleep(2 ** attempt)
+            continue
+        raise RuntimeError(f"SEC returned {status}.")
+
+    raise RuntimeError(
+        f"SEC returned {status} after 4 attempts. If 403: --user-agent must be a "
+        f"descriptive contact string such as 'Jane Doe jane@firm.com'. If 429: your "
+        f"IP is rate-limited (10 req/sec, shared per IP); wait ~10 minutes."
+    )
+
+
+# ===========================================================================
+# 4. Fact extraction
+# ===========================================================================
+
+@dataclass
+class Fact:
+    concept: str
+    taxonomy: str
+    value: float
+    unit: str
+    end: date
+    start: date | None
+    fy: int | None
+    fp: str | None
+    form: str
+    filed: date
+    frame: str | None = None
+
+    @property
+    def days(self) -> int | None:
+        if self.start is None:
+            return None
+        return (self.end - self.start).days
+
+    @property
+    def is_instant(self) -> bool:
+        return self.start is None
+
+
+def _d(s: str | None) -> date | None:
+    return datetime.strptime(s, "%Y-%m-%d").date() if s else None
+
+
+def index_facts(companyfacts: dict) -> dict[str, list[Fact]]:
+    """Flatten companyfacts JSON into {concept: [Fact, ...]}."""
+    out: dict[str, list[Fact]] = defaultdict(list)
+    for taxonomy, concepts in companyfacts.get("facts", {}).items():
+        for concept, payload in concepts.items():
+            for unit, entries in payload.get("units", {}).items():
+                for e in entries:
+                    try:
+                        out[concept].append(
+                            Fact(
+                                concept=concept,
+                                taxonomy=taxonomy,
+                                value=float(e["val"]),
+                                unit=unit,
+                                end=_d(e["end"]),
+                                start=_d(e.get("start")),
+                                fy=e.get("fy"),
+                                fp=e.get("fp"),
+                                form=e.get("form", ""),
+                                filed=_d(e.get("filed")) or date.min,
+                                frame=e.get("frame"),
+                            )
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
+    return out
+
+
+FORM_RANK = {"10-K": 0, "10-K/A": 0, "10-Q": 1, "10-Q/A": 1, "8-K": 3, "20-F": 0}
+
+
+def _pick(cands: list[Fact]) -> Fact | None:
+    """Prefer periodic reports over 8-K, then the most recently filed value
+    (restatements supersede originals)."""
+    if not cands:
+        return None
+    return sorted(cands, key=lambda f: (FORM_RANK.get(f.form, 2), -f.filed.toordinal()))[0]
+
+
+def instant_value(facts: dict[str, list[Fact]], concept: str, end: date) -> tuple[float | None, str | None]:
+    for c in chain(concept):
+        hits = [f for f in facts.get(c, []) if f.is_instant and f.end == end and f.unit == "USD"]
+        f = _pick(hits)
+        if f:
+            return f.value, c
+    return None, None
+
+
+def duration_value(
+    facts: dict[str, list[Fact]],
+    concept: str,
+    end: date,
+    target_days: tuple[int, int],
+    unit: str = "USD",
+) -> tuple[float | None, str | None]:
+    for c in chain(concept):
+        hits = [
+            f
+            for f in facts.get(c, [])
+            if not f.is_instant
+            and f.end == end
+            and f.unit in (unit, "USD/shares", "shares")
+            and target_days[0] <= (f.days or 0) <= target_days[1]
+        ]
+        f = _pick(hits)
+        if f:
+            return f.value, c
+    return None, None
+
+
+QTR_DAYS = (80, 100)
+YTD_DAYS = (350, 380)
+
+
+def quarterly_value(
+    facts: dict[str, list[Fact]], concept: str, period: "Period"
+) -> tuple[float | None, str | None]:
+    """Discrete-quarter value.
+
+    A natively reported ~90-day fact is used when present. Q4 is never filed on
+    a 10-Q, so it is derived as FY less the three prior quarters. This derivation
+    is the single most common source of error in hand-built quarterly models.
+    """
+    v, used = duration_value(facts, concept, period.end, QTR_DAYS)
+    if v is not None:
+        return v, used
+
+    if period.fp == "Q4" and period.prior_q_ends:
+        fy_val, used = duration_value(facts, concept, period.end, YTD_DAYS)
+        if fy_val is None:
+            return None, None
+        total = 0.0
+        for qe in period.prior_q_ends:
+            qv, _ = duration_value(facts, concept, qe, QTR_DAYS)
+            if qv is None:
+                return None, None
+            total += qv
+        return fy_val - total, (used + " [derived Q4]") if used else None
+    return None, None
+
+
+# ===========================================================================
+# 5. Period scaffold
+# ===========================================================================
+
+@dataclass
+class Period:
+    end: date
+    fy: int
+    fp: str                       # Q1 | Q2 | Q3 | Q4
+    prior_end: date | None = None
+    prior_q_ends: list[date] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        return f"FY{self.fy}{self.fp}"
+
+
+def build_periods(facts: dict[str, list[Fact]], n: int) -> list[Period]:
+    """Derive the reporting calendar from Assets instant facts (present in
+    every filing) rather than assuming calendar quarter-ends."""
+    assets = [f for f in facts.get("Assets", []) if f.is_instant and f.unit == "USD"]
+    if not assets:
+        raise RuntimeError("no us-gaap:Assets facts — cannot establish period grid")
+
+    by_end: dict[date, Fact] = {}
+    for f in sorted(assets, key=lambda x: x.filed):
+        by_end[f.end] = f  # last write wins = most recently filed
+
+    ends = sorted(by_end)
+    periods: list[Period] = []
+    for i, e in enumerate(ends):
+        f = by_end[e]
+        fp = f.fp or ("Q4" if f.form.startswith("10-K") else "Q?")
+        fp = "Q4" if fp == "FY" else fp
+        fy = f.fy or e.year
+        p = Period(end=e, fy=fy, fp=fp, prior_end=ends[i - 1] if i else None)
+        periods.append(p)
+
+    # attach the three prior quarter-ends inside the same fiscal year for Q4 derivation
+    for i, p in enumerate(periods):
+        if p.fp == "Q4":
+            p.prior_q_ends = [q.end for q in periods[max(0, i - 3) : i]]
+
+    return periods[-n:] if n else periods
+
+
+# ===========================================================================
+# 6. Panel assembly
+# ===========================================================================
+
+def build_panel(
+    facts: dict[str, list[Fact]], lines: list[MappedLine], periods: list[Period]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows, prov = [], []
+    for ln in lines:
+        row = {"FSLI": ln.raw_fsli or ln.fsli, "XBRL Tag": ln.tag}
+        prow = dict(row)
+        for p in periods:
+            if ln.statement == "BS":
+                v, used = instant_value(facts, ln.concept, p.end)
+            else:
+                v, used = quarterly_value(facts, ln.concept, p)
+            row[p.label] = v
+            prow[p.label] = used or ""
+        rows.append(row)
+        prov.append(prow)
+    return pd.DataFrame(rows), pd.DataFrame(prov)
+
+
+def value_grid(facts: dict[str, list[Fact]], periods: list[Period], concepts: Iterable[str], kind: str) -> dict:
+    """{(concept, period_label): value} for the concepts the checks need."""
+    grid: dict[tuple[str, str], float | None] = {}
+    for c in concepts:
+        for p in periods:
+            if kind == "instant":
+                v, _ = instant_value(facts, c, p.end)
+            else:
+                v, _ = quarterly_value(facts, c, p)
+            grid[(c, p.label)] = v
+    return grid
+
+
+# ===========================================================================
+# 7. Integrity checks
+# ===========================================================================
+
+SMALL_MAGNITUDE = 1_000.0   # below this, values are per-share / ratios, not dollars
+SMALL_ABS_TOL = 0.01        # one cent
+
+
+def _ok(lhs: float, rhs: float) -> tuple[bool, float]:
+    """Pass if within EITHER the absolute or the relative band.
+
+    The absolute band is scale-aware: a $1MM tolerance is right for statement
+    totals but would make an EPS comparison ($2.94 vs $9.41) pass trivially, so
+    small-magnitude values fall back to a one-cent band.
+    """
+    diff = lhs - rhs
+    scale = max(abs(lhs), abs(rhs), 1.0)
+    abs_tol = SMALL_ABS_TOL if scale < SMALL_MAGNITUDE else ABS_TOL
+    return (abs(diff) <= abs_tol or abs(diff) / scale <= REL_TOL), diff
+
+
+def _s(x: float | None) -> float:
+    return 0.0 if x is None else x
+
+
+def run_checks(facts: dict[str, list[Fact]], periods: list[Period]) -> pd.DataFrame:
+    inst = value_grid(
+        facts,
+        periods,
+        [
+            "Assets", "AssetsCurrent", "Liabilities", "LiabilitiesCurrent",
+            "LiabilitiesAndStockholdersEquity", "StockholdersEquity",
+            "CashAndCashEquivalentsAtCarryingValue", "DebtSecuritiesCurrent",
+            "EquitySecuritiesFvNi", "AccountsReceivableNetCurrent", "InventoryNet",
+            "PrepaidExpenseAndOtherAssetsCurrent", "AccountsPayableCurrent",
+            "AccruedLiabilitiesCurrent", "DebtCurrent", "CommonStockValue",
+            "PreferredStockValueOutstanding", "AdditionalPaidInCapital",
+            "AccumulatedOtherComprehensiveIncomeLossNetOfTax",
+            "RetainedEarningsAccumulatedDeficit",
+        ],
+        "instant",
+    )
+    dur = value_grid(
+        facts,
+        periods,
+        [
+            "Revenues", "CostOfRevenue", "GrossProfit", "ResearchAndDevelopmentExpense",
+            "SellingGeneralAndAdministrativeExpense", "OperatingExpenses",
+            "OperatingIncomeLoss", "InvestmentIncomeInterest", "InterestExpenseNonoperating",
+            "OtherNonoperatingIncomeExpense", "NonoperatingIncomeExpense",
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+            "IncomeTaxExpenseBenefit", "NetIncomeLoss",
+            "OtherComprehensiveIncomeLossNetOfTaxPortionAttributableToParent",
+            "ComprehensiveIncomeNetOfTax", "StockIssuedDuringPeriodValueNewIssues",
+            "ShareBasedCompensation",
+            "PaymentsRelatedToTaxWithholdingForShareBasedCompensation",
+            "PaymentsForRepurchaseOfCommonStock", "PaymentsOfDividendsCommonStock",
+        ],
+        "duration",
+    )
+
+    prior_se = {p.label: inst.get(("StockholdersEquity", pl.label)) if (pl := _prior(periods, p)) else None
+                for p in periods}
+
+    out = []
+
+    def add(pid, period, name, lhs, rhs, detail="", inputs_present=True):
+        if lhs is None or rhs is None or not inputs_present:
+            out.append(dict(check_id=pid, period=period.label, period_end=period.end,
+                            check=name, lhs=lhs, rhs=rhs, difference=None,
+                            status="SKIP (missing inputs)", detail=detail))
+            return
+        good, diff = _ok(lhs, rhs)
+        out.append(dict(check_id=pid, period=period.label, period_end=period.end,
+                        check=name, lhs=lhs, rhs=rhs, difference=diff,
+                        status="PASS" if good else "FAIL", detail=detail))
+
+    for p in periods:
+        L = p.label
+        g = lambda c: inst.get((c, L))
+        d = lambda c: dur.get((c, L))
+
+        # --- Balance sheet ------------------------------------------------
+        add("BS01", p, "Assets = Liabilities and Shareholders' Equity",
+            g("Assets"), g("LiabilitiesAndStockholdersEquity"))
+
+        add("BS02", p, "Assets = Total Liabilities + Total Shareholders' Equity",
+            g("Assets"),
+            None if g("Liabilities") is None or g("StockholdersEquity") is None
+            else g("Liabilities") + g("StockholdersEquity"))
+
+        ca_parts = ["CashAndCashEquivalentsAtCarryingValue", "DebtSecuritiesCurrent",
+                    "EquitySecuritiesFvNi", "AccountsReceivableNetCurrent", "InventoryNet",
+                    "PrepaidExpenseAndOtherAssetsCurrent"]
+        ca_have = [g(c) for c in ca_parts if g(c) is not None]
+        add("BS03", p, "Total current assets = sum of components",
+            g("AssetsCurrent"), sum(ca_have) if ca_have else None,
+            detail=f"{len(ca_have)}/{len(ca_parts)} components tagged")
+
+        cl_parts = ["AccountsPayableCurrent", "AccruedLiabilitiesCurrent", "DebtCurrent"]
+        cl_have = [g(c) for c in cl_parts if g(c) is not None]
+        add("BS04", p, "Total current liabilities = sum of components",
+            g("LiabilitiesCurrent"), sum(cl_have) if cl_have else None,
+            detail=f"{len(cl_have)}/{len(cl_parts)} components tagged")
+
+        eq_parts = ["PreferredStockValueOutstanding", "CommonStockValue", "AdditionalPaidInCapital",
+                    "AccumulatedOtherComprehensiveIncomeLossNetOfTax",
+                    "RetainedEarningsAccumulatedDeficit"]
+        eq_have = [g(c) for c in eq_parts if g(c) is not None]
+        add("BS05", p, "Total shareholders' equity = sum of components",
+            g("StockholdersEquity"), sum(eq_have) if eq_have else None,
+            detail=f"{len(eq_have)}/{len(eq_parts)} components tagged")
+
+        # --- Income statement ---------------------------------------------
+        add("IS01", p, "Revenue - Cost of revenue = Gross profit",
+            None if d("Revenues") is None or d("CostOfRevenue") is None
+            else d("Revenues") - d("CostOfRevenue"), d("GrossProfit"))
+
+        add("IS02", p, "Gross profit - Total opex = Operating income",
+            None if d("GrossProfit") is None or d("OperatingExpenses") is None
+            else d("GrossProfit") - d("OperatingExpenses"), d("OperatingIncomeLoss"))
+
+        add("IS03", p, "Operating income + Total other income = Pretax income",
+            None if d("OperatingIncomeLoss") is None or d("NonoperatingIncomeExpense") is None
+            else d("OperatingIncomeLoss") + d("NonoperatingIncomeExpense"),
+            d("IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"))
+
+        add("IS04", p, "Pretax income - Tax expense = Net income",
+            None if d("IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest") is None
+            or d("IncomeTaxExpenseBenefit") is None
+            else d("IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest")
+                 - d("IncomeTaxExpenseBenefit"), d("NetIncomeLoss"))
+
+        add("IS05", p, "Net income + OCI = Comprehensive income",
+            None if d("NetIncomeLoss") is None
+            or d("OtherComprehensiveIncomeLossNetOfTaxPortionAttributableToParent") is None
+            else d("NetIncomeLoss") + d("OtherComprehensiveIncomeLossNetOfTaxPortionAttributableToParent"),
+            d("ComprehensiveIncomeNetOfTax"))
+
+        # --- Equity rollforward -------------------------------------------
+        beg = prior_se[L]
+        end_se = g("StockholdersEquity")
+        if beg is None or end_se is None:
+            add("EQ01", p, "Shareholders' equity rollforward", None, None,
+                detail="no prior-period equity balance (first period in panel)")
+        else:
+            ni   = _s(d("NetIncomeLoss"))
+            oci  = _s(d("OtherComprehensiveIncomeLossNetOfTaxPortionAttributableToParent"))
+            iss  = _s(d("StockIssuedDuringPeriodValueNewIssues"))
+            sbc  = _s(d("ShareBasedCompensation"))
+            twh  = _s(d("PaymentsRelatedToTaxWithholdingForShareBasedCompensation"))
+            bb   = _s(d("PaymentsForRepurchaseOfCommonStock"))
+            div  = _s(d("PaymentsOfDividendsCommonStock"))
+            roll = beg + ni + oci + iss + sbc - twh - bb - div
+            missing = [n for n, v in [
+                ("NetIncomeLoss", d("NetIncomeLoss")),
+                ("OCI", d("OtherComprehensiveIncomeLossNetOfTaxPortionAttributableToParent")),
+                ("StockIssued", d("StockIssuedDuringPeriodValueNewIssues")),
+                ("SBC", d("ShareBasedCompensation")),
+                ("TaxWithholding", d("PaymentsRelatedToTaxWithholdingForShareBasedCompensation")),
+                ("Repurchases", d("PaymentsForRepurchaseOfCommonStock")),
+                ("Dividends", d("PaymentsOfDividendsCommonStock")),
+            ] if v is None]
+            det = (f"beg={beg:,.0f} NI={ni:,.0f} OCI={oci:,.0f} iss={iss:,.0f} "
+                   f"SBC={sbc:,.0f} twh=({twh:,.0f}) bb=({bb:,.0f}) div=({div:,.0f})")
+            if missing:
+                det += f" | untagged, treated as 0: {', '.join(missing)}"
+            add("EQ01", p, "Shareholders' equity rollforward", roll, end_se, detail=det)
+
+    df = pd.DataFrame(out)
+    return df
+
+
+def _prior(periods: list[Period], p: Period) -> Period | None:
+    for i, q in enumerate(periods):
+        if q.end == p.end and i > 0:
+            return periods[i - 1]
+    return None
+
+
+# ===========================================================================
+# 8. Long-format export (Sheets / BI friendly)
+# ===========================================================================
+
+def long_table(panel_bs: pd.DataFrame, panel_is: pd.DataFrame, periods: list[Period]) -> pd.DataFrame:
+    frames = []
+    for stmt, df in (("Balance Sheet", panel_bs), ("Income Statement", panel_is)):
+        m = df.melt(id_vars=["FSLI", "XBRL Tag"], var_name="period", value_name="value")
+        m["statement"] = stmt
+        frames.append(m)
+    out = pd.concat(frames, ignore_index=True)
+    ends = {p.label: p.end for p in periods}
+    out["period_end"] = out["period"].map(ends)
+    return out[["statement", "FSLI", "XBRL Tag", "period", "period_end", "value"]]
+
+
+# ===========================================================================
+# 9. CLI
+# ===========================================================================
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--cik", type=int, default=1045810, help="CIK, digits only (NVIDIA = 1045810)")
+    ap.add_argument("--ticker", default="NVDA")
+    ap.add_argument("--bs", required=True, help="balance sheet mapping CSV")
+    ap.add_argument("--is", dest="is_", required=True, help="income statement mapping CSV")
+    ap.add_argument("--user-agent", default="", help='required by SEC, e.g. "Jane Doe jane@firm.com"')
+    ap.add_argument("--periods", type=int, default=12, help="most recent N quarters (0 = all)")
+    ap.add_argument("--outdir", default="./out")
+    ap.add_argument("--cache", default="", help="path to cache the companyfacts JSON")
+    ap.add_argument("--fixture", default="", help="local companyfacts JSON; skips network")
+    args = ap.parse_args(argv)
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    if args.fixture:
+        with open(args.fixture) as fh:
+            cf = json.load(fh)
+    else:
+        if not args.user_agent:
+            print("ERROR: --user-agent is mandatory. SEC returns 403 without a real "
+                  'contact string, e.g. --user-agent "Jane Doe jane@firm.com"', file=sys.stderr)
+            return 2
+        cf = fetch_companyfacts(args.cik, args.user_agent, args.cache or None)
+
+    facts = index_facts(cf)
+    periods = build_periods(facts, args.periods)
+    print(f"Entity: {cf.get('entityName','?')}  |  periods: "
+          f"{periods[0].label} ({periods[0].end}) -> {periods[-1].label} ({periods[-1].end})")
+
+    bs_lines = load_mapping(args.bs, "BS")
+    is_lines = load_mapping(args.is_, "IS")
+    print(f"Mapping: {len(bs_lines)} BS lines, {len(is_lines)} IS lines")
+
+    panel_bs, prov_bs = build_panel(facts, bs_lines, periods)
+    panel_is, prov_is = build_panel(facts, is_lines, periods)
+    checks = run_checks(facts, periods)
+
+    panel_bs.to_csv(f"{args.outdir}/panel_balance_sheet.csv", index=False)
+    panel_is.to_csv(f"{args.outdir}/panel_income_statement.csv", index=False)
+    pd.concat([prov_bs.assign(statement="BS"), prov_is.assign(statement="IS")]).to_csv(
+        f"{args.outdir}/tag_provenance.csv", index=False)
+    checks.to_csv(f"{args.outdir}/check_results.csv", index=False)
+    long_table(panel_bs, panel_is, periods).to_csv(f"{args.outdir}/facts_long.csv", index=False)
+
+    # coverage
+    pcols = [p.label for p in periods]
+    filled = panel_bs[pcols].notna().sum().sum() + panel_is[pcols].notna().sum().sum()
+    total = (len(panel_bs) + len(panel_is)) * len(pcols)
+    print(f"Coverage: {filled}/{total} cells populated ({filled/total:.0%})")
+
+    n_fail = (checks.status == "FAIL").sum()
+    n_skip = checks.status.str.startswith("SKIP").sum()
+    n_pass = (checks.status == "PASS").sum()
+    print(f"Checks: {n_pass} pass, {n_fail} FAIL, {n_skip} skipped")
+    if n_fail:
+        print("\n--- FAILURES ---")
+        cols = ["check_id", "period", "check", "lhs", "rhs", "difference", "detail"]
+        print(checks[checks.status == "FAIL"][cols].to_string(index=False))
+    print(f"\nWrote 5 files to {args.outdir}/")
+    return 1 if n_fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())"
