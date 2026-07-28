@@ -34,24 +34,48 @@ and its check battery depends on undimensioned facts. This runs beside it on a
 different source. Do not try to merge them: a dimensional revenue fact and a
 consolidated revenue fact are different numbers and summing them double-counts.
 
-ALIGNED HISTORICAL MODE  (--periods N)
---------------------------------------
-A single instance carries only one quarter, so the default single-filing mode
-cannot produce a history. --periods N reuses xbrl_panel.py's OWN period logic
-(imported directly, so the grids are identical by construction) to build the
-last N fiscal quarters, then fetches every filing instance needed to cover them
-and pivots revenue-by-dimension onto that same FY####Q# column grid. Fiscal Q4
-is derived as FY less the three prior quarters, exactly as the panel does — so
-the segment/platform/geographic panels line up column-for-column with
-panel_income_statement.csv.
+ALIGNED HISTORICAL MODE  (default; --start / --periods)
+-------------------------------------------------------
+A single instance carries only one quarter, so the single-filing mode cannot
+produce a history. Aligned mode reuses xbrl_panel.py's OWN period logic
+(imported directly, so the grids are identical by construction), fetches every
+filing instance needed to cover the window, and pivots dimensioned facts onto
+that same FY####Q# column grid. Fiscal Q4 is derived as FY less the three prior
+quarters, exactly as the panel does — so the panels line up column-for-column
+with panel_income_statement.csv.
+
+  --start FY####Q#   anchor the FIRST period to pull (default FY2024Q2, the
+                     first quarter the financial-statement panels carry). The
+                     window runs from there to the latest available quarter.
+  --periods N        alternatively, the last N quarters (used when --start is
+                     omitted).
+
+It emits the FULL segment note (ASC 280 / ASU 2023-07), not just revenue:
+  - revenue, operating income, "other item" amount, and D&A by reportable
+    segment (operating-segments members only);
+  - segment operating margin (operating income / revenue);
+  - the corporate reconciliation bridge from total segment operating income to
+    consolidated income before tax (unallocated corporate costs, SBC,
+    acquisition-related costs, interest, other) — the corporate rows from the
+    consolidation-axis reconciling member, the below-the-line rows from the
+    entity-wide default context;
+  - revenue by product/market platform and by geography, on the same grid.
+All are additive period flows, so the FY-less-three-quarters Q4 derivation is
+valid for each (per-share and ratio concepts are never derived by subtraction).
 
 USAGE  (single-line commands -- do not copy a line continuation)
 -----
-  Aligned history matching the panel's 12 quarters (PRIMARY: market platform):
+  Full segment disclosure from Q2 FY2024 to latest (PRIMARY; --start defaults there):
+    python segment_extension.py --user-agent "Ozoemena Nnamadim ozoemena@otnnamadim.com"
+
+  Explicit start quarter:
+    python segment_extension.py --start FY2024Q2 --user-agent "Ozoemena Nnamadim ozoemena@otnnamadim.com"
+
+  Last 12 quarters instead of a fixed start:
     python segment_extension.py --periods 12 --user-agent "Ozoemena Nnamadim ozoemena@otnnamadim.com"
 
   Aligned history, offline (grid from a companyfacts JSON, instances from a folder):
-    python segment_extension.py --periods 12 --companyfacts companyfacts.json --instance-dir ./instances
+    python segment_extension.py --start FY2024Q2 --companyfacts companyfacts.json --instance-dir ./instances
 
   Latest 10-Q, accession resolved automatically (single-filing mode):
     python segment_extension.py --latest 10-Q --user-agent "Ozoemena Nnamadim ozoemena@otnnamadim.com"
@@ -168,16 +192,25 @@ def fetch_instance(cik: int, accession: str, user_agent: str) -> bytes:
 # ===========================================================================
 
 def build_period_grid(cik: int, user_agent: str, n: int,
-                      companyfacts_path: str | None = None) -> list:
-    """Return the SAME Period objects xbrl_panel.py would build for --periods N.
+                      companyfacts_path: str | None = None,
+                      start_label: str | None = None) -> list:
+    """Return the SAME Period objects xbrl_panel.py would build.
 
-    We import and call the panel's own index_facts / build_periods so the
-    two panels share one definition of "the last N quarters" (identical end
-    dates, FY####Q# labels, and prior_q_ends for Q4 derivation)."""
+    We import and call the panel's own index_facts / build_periods so the two
+    panels share one definition of the reporting calendar (identical end dates,
+    FY####Q# labels, and prior_q_ends for Q4 derivation).
+
+    ``start_label`` (e.g. "FY2024Q2") anchors the FIRST period to pull: the grid
+    keeps every period on or after that period's end date. Anchoring by end date
+    rather than by label string is deliberate — it is robust to the panel's
+    fiscal-year labelling quirk on annual/Q4 periods, and a Q4 derivation still
+    reaches back into prior quarters that precede the start (they stay available
+    for the arithmetic without appearing as their own columns). When no start is
+    given, ``n`` selects the last N quarters, as before."""
     if _panel is None:
         raise RuntimeError(
             "xbrl_panel.py must be importable to align periods. Put it next to this "
-            "script; --periods reuses its period logic so the grids match exactly.")
+            "script; aligned mode reuses its period logic so the grids match exactly.")
     if companyfacts_path:
         with open(companyfacts_path) as fh:
             cf = json.load(fh)
@@ -188,6 +221,17 @@ def build_period_grid(cik: int, user_agent: str, n: int,
             "aligned mode needs --user-agent (online) or --companyfacts (offline) "
             "to build the period grid.")
     facts = _panel.index_facts(cf)
+
+    if start_label:
+        allp = _panel.build_periods(facts, 0)          # every period, chronological
+        match = [p for p in allp if p.label == start_label]
+        if not match:
+            raise RuntimeError(
+                f"start period {start_label!r} not found. Available labels: "
+                f"{', '.join(p.label for p in allp)}")
+        start_end = match[0].end
+        return [p for p in allp if p.end >= start_end]
+
     return _panel.build_periods(facts, n)
 
 
@@ -388,7 +432,52 @@ SEGMENT_CONCEPTS = {
     "revenue": REVENUE_CONCEPTS,
     "other_items": ["SegmentReportingOtherItemAmount"],
     "operating_income": ["OperatingIncomeLoss"],
+    "dna": ["DepreciationDepletionAndAmortization"],
 }
+
+# Per-segment metrics pulled onto the aligned grid (label -> concept fallbacks).
+# All are additive period flows, so the FY-less-three-quarters Q4 derivation is
+# valid for each (unlike per-share or ratio concepts, which must never be
+# derived by subtraction).
+SEGMENT_METRICS = {
+    "revenue":          REVENUE_CONCEPTS,
+    "operating_income": ["OperatingIncomeLoss"],
+    "other_item":       ["SegmentReportingOtherItemAmount"],
+    "dna":              ["DepreciationDepletionAndAmortization"],
+}
+
+# The corporate / reconciling block that bridges total segment operating income
+# down to consolidated income before tax (ASU 2023-07 enhanced disclosure).
+# Each row is (display label, concept fallbacks, scope). scope decides where the
+# value is read from:
+#   "corporate"    -> facts dimensioned on the consolidation axis with a
+#                     corporate / non-segment / reconciling member
+#   "consolidated" -> the entity-wide default-context value (no dimensions),
+#                     i.e. the same number the face income statement reports
+RECONCILIATION_ROWS = [
+    ("Corporate unallocated operating income (loss)",
+        ["OperatingIncomeLoss"], "corporate"),
+    ("  Stock-based compensation expense",
+        ["AllocatedShareBasedCompensationExpense", "ShareBasedCompensation"], "corporate"),
+    ("  Unallocated corporate costs and other",
+        ["UnallocatedCorporateOperatingExpendituresAndOtherExpenses"], "corporate"),
+    ("  Acquisition-related and other costs",
+        ["AcquisitionRelatedAndOtherCosts", "AcquisitionRelatedCostsAndOther"], "corporate"),
+    ("Interest income",
+        ["InvestmentIncomeInterest"], "consolidated"),
+    ("Interest expense",
+        ["InterestExpenseNonoperating", "InterestExpense"], "consolidated"),
+    ("Other, net",
+        ["OtherNonoperatingIncomeExpense", "NonoperatingIncomeExpense"], "consolidated"),
+    ("Income before income tax",
+        ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"],
+        "consolidated"),
+]
+
+# Consolidation-axis members that are NOT operating segments: the corporate /
+# reconciling side of the note. Matched case-insensitively on the member QName.
+CORP_MEMBER_RE = re.compile(r"Corporate|Nonsegment|NonSegment|Reconcil", re.I)
 
 
 def resolve_axes(df: pd.DataFrame) -> dict[str, str | None]:
@@ -435,18 +524,49 @@ QTR_DAYS = (80, 100)
 YTD_DAYS = (350, 380)
 
 
-def aligned_quarterly_revenue(fac: pd.DataFrame, periods: list, axis: str | None,
-                              label: str, cons_axis: str | None = None,
-                              operating_only: bool = False) -> pd.DataFrame:
-    """Pivot dimensioned revenue onto the panel's FY####Q# columns.
+def _derive_over_periods(get_value, periods) -> dict:
+    """Map one series onto the FY####Q# grid, deriving fiscal Q4.
 
-    For each member and each period we take the natively reported ~90-day fact.
-    Fiscal Q4 is never filed on a 10-Q, so — exactly like xbrl_panel.py's
-    quarterly_value — it is derived as the FY figure less the three prior
-    quarters (period.prior_q_ends, which the panel already attached). A member
-    that did not exist in a given quarter (e.g. post-rename platform names in
-    older periods) is left blank, so old and new taxonomies coexist in one
-    panel without being force-mapped onto each other."""
+    ``get_value(end_iso, lo, hi) -> float | None`` returns the natively reported
+    duration fact ending on ``end_iso`` whose length falls in [lo, hi] days.
+    Non-Q4 quarters take the ~90-day fact directly. Fiscal Q4 is never filed on
+    a 10-Q, so — exactly like xbrl_panel.py's quarterly_value — it is the FY
+    figure less the three prior quarters (period.prior_q_ends). If any input the
+    Q4 derivation needs is missing, the cell is left blank rather than guessed.
+    """
+    out: dict[str, float | None] = {}
+    for p in periods:
+        if p.fp != "Q4":
+            out[p.label] = get_value(p.end.isoformat(), *QTR_DAYS)
+            continue
+        fy_v = get_value(p.end.isoformat(), *YTD_DAYS)
+        if fy_v is None:
+            out[p.label] = None
+            continue
+        total, ok = 0.0, True
+        for qe in p.prior_q_ends:
+            qv = get_value(qe.isoformat(), *QTR_DAYS)
+            if qv is None:
+                ok = False
+                break
+            total += qv
+        out[p.label] = (fy_v - total) if ok else None
+    return out
+
+
+def aligned_quarterly_metric(fac: pd.DataFrame, periods: list, axis: str | None,
+                             label: str, concepts: list[str] | None = None,
+                             cons_axis: str | None = None,
+                             operating_only: bool = False) -> pd.DataFrame:
+    """Pivot a dimensioned metric onto the panel's FY####Q# columns.
+
+    ``axis`` is the dimension whose members become rows (segment / product /
+    geography). ``concepts`` is the ordered fallback list for the metric being
+    pulled (revenue, operating income, other-item amount, D&A, ...); the first
+    concept present in a given cell wins. A member absent in a quarter is left
+    blank, so renamed members (platform members changed at Q1 FY2027) coexist in
+    one panel without being force-mapped onto each other."""
+    concepts = concepts or REVENUE_CONCEPTS
     if axis is None or axis not in fac.columns:
         return pd.DataFrame()
 
@@ -454,49 +574,78 @@ def aligned_quarterly_revenue(fac: pd.DataFrame, periods: list, axis: str | None
     d["days_num"] = pd.to_numeric(d["days"], errors="coerce")
     if operating_only and cons_axis and cons_axis in d.columns:
         # keep operating-segment facts only; drop elimination / reconciling members
-        d = d[d[cons_axis].isna() | d[cons_axis].str.contains("OperatingSegments", na=False)]
+        d = d[d[cons_axis].isna() | d[cons_axis].astype(str).str.contains("OperatingSegments", na=False)]
 
     members = sorted(m for m in d[axis].dropna().unique())
     if not members:
         return pd.DataFrame()
 
-    def val(member: str, end_iso: str, lo: int, hi: int) -> float | None:
-        sub = d[(d[axis] == member) & (d["end"] == end_iso)
-                & (d["days_num"] >= lo) & (d["days_num"] <= hi)]
-        for c in REVENUE_CONCEPTS:            # ASC 606 concept first, then fallbacks
-            s = sub[sub["concept"] == c]["value"]
-            if len(s):
-                return float(s.iloc[-1])
-        return None
-
     cols: dict[str, dict] = {}
-    for p in periods:
-        end_iso = p.end.isoformat()
-        col = {}
-        for m in members:
-            if p.fp != "Q4":
-                v = val(m, end_iso, *QTR_DAYS)
-            else:
-                fy_v = val(m, end_iso, *YTD_DAYS)
-                if fy_v is None:
-                    v = None
-                else:
-                    total, ok = 0.0, True
-                    for qe in p.prior_q_ends:
-                        qv = val(m, qe.isoformat(), *QTR_DAYS)
-                        if qv is None:
-                            ok = False
-                            break
-                        total += qv
-                    v = fy_v - total if ok else None
-            col[m] = v
-        cols[p.label] = col
+    for m in members:
+        def get_value(end_iso, lo, hi, m=m):
+            sub = d[(d[axis] == m) & (d["end"] == end_iso)
+                    & (d["days_num"] >= lo) & (d["days_num"] <= hi)]
+            for c in concepts:
+                s = sub[sub["concept"] == c]["value"]
+                if len(s):
+                    return float(s.iloc[-1])
+            return None
+        cols[m] = _derive_over_periods(get_value, periods)
 
-    df = pd.DataFrame(cols)
+    df = pd.DataFrame(cols).T
+    df = df.reindex(columns=[p.label for p in periods])
     df.index = [re.sub(r"Member$", "", str(m).split(":")[-1]) for m in df.index]
     df.index.name = f"{label} ($mm)"
     df = (df / 1e6).round(1)
     return df.dropna(how="all")   # drop members with no data across the window
+
+
+# Back-compat alias: revenue is just the metric with the revenue concept chain.
+def aligned_quarterly_revenue(fac, periods, axis, label, cons_axis=None,
+                              operating_only=False):
+    return aligned_quarterly_metric(fac, periods, axis, label, REVENUE_CONCEPTS,
+                                    cons_axis=cons_axis, operating_only=operating_only)
+
+
+def aligned_reconciliation(fac: pd.DataFrame, periods: list,
+                           cons_axis: str | None) -> pd.DataFrame:
+    """Corporate / reconciling bridge from segment operating income to
+    consolidated income before tax, on the aligned FY####Q# grid.
+
+    Corporate rows are read from consolidation-axis facts whose member is a
+    corporate / non-segment / reconciling member; the below-the-line rows
+    (interest, other, pre-tax income) are read from the entity-wide default
+    context — the same figures the face income statement carries. Each row is an
+    additive flow, so fiscal Q4 derives the same way as every other panel."""
+    d = fac.copy()
+    d["days_num"] = pd.to_numeric(d["days"], errors="coerce")
+
+    if cons_axis and cons_axis in d.columns:
+        corp = d[d[cons_axis].astype(str).str.contains(CORP_MEMBER_RE, na=False)]
+    else:
+        corp = d.iloc[0:0]
+    cons = d[d["n_dims"] == 0]   # undimensioned, entity-wide facts
+
+    rows: dict[str, dict] = {}
+    for label, concepts, scope in RECONCILIATION_ROWS:
+        src = corp if scope == "corporate" else cons
+
+        def get_value(end_iso, lo, hi, src=src, concepts=concepts):
+            sub = src[(src["end"] == end_iso)
+                      & (src["days_num"] >= lo) & (src["days_num"] <= hi)]
+            for c in concepts:
+                s = sub[sub["concept"] == c]["value"]
+                if len(s):
+                    return float(s.iloc[-1])
+            return None
+
+        rows[label] = _derive_over_periods(get_value, periods)
+
+    df = pd.DataFrame(rows).T
+    df = df.reindex(columns=[p.label for p in periods])
+    df = (df / 1e6).round(1)
+    df.index.name = "Reconciliation to pre-tax income ($mm)"
+    return df.dropna(how="all")
 
 
 # ===========================================================================
@@ -514,13 +663,19 @@ def segment_analysis(df: pd.DataFrame, axes: dict, period: str = "annual"):
         # reconciling-item members that would otherwise be summed in.
         d = d[d[cons_axis].isna() | d[cons_axis].str.contains("OperatingSegments", na=False)]
 
+    # Restrict to facts that actually carry the segment axis before choosing the
+    # concept — otherwise a revenue concept used only in the product/geographic
+    # disaggregation (but never on the segment axis) can be picked, yielding an
+    # empty pivot.
+    d_seg = d[d[seg_axis].notna()] if seg_axis in d.columns else d.iloc[0:0]
+
     out = {}
     for key, cands in SEGMENT_CONCEPTS.items():
-        concept = pick_concept(d, cands)
+        concept = pick_concept(d_seg, cands)
         if concept is None:
             out[key] = pd.DataFrame()
             continue
-        out[key] = _pivot(d[d["concept"] == concept], seg_axis, key)
+        out[key] = _pivot(d_seg[d_seg["concept"] == concept], seg_axis, key)
 
     note = ("Segment operating income does NOT equal consolidated EBIT. Unallocated corporate "
             "costs sit outside the segment note: Q1FY27 segment OI totalled 56,276 on 81,615 "
@@ -572,6 +727,30 @@ def platform_analysis(df: pd.DataFrame, axes: dict, period: str = "quarter"):
     return p, note
 
 
+def reconciliation_analysis(df: pd.DataFrame, axes: dict, period: str = "quarter"):
+    """Single-filing corporate/reconciling bridge to consolidated pre-tax income."""
+    cons_axis = axes.get("consolidation")
+    d = _annual_or_quarter(df, "annual" if period == "annual" else "quarter")
+    if cons_axis and cons_axis in d.columns:
+        corp = d[d[cons_axis].astype(str).str.contains(CORP_MEMBER_RE, na=False)]
+    else:
+        corp = d.iloc[0:0]
+    cons = d[d["n_dims"] == 0]
+
+    rows = {}
+    for label, concepts, scope in RECONCILIATION_ROWS:
+        src = corp if scope == "corporate" else cons
+        val = None
+        for c in concepts:
+            s = src[src["concept"] == c]["value"]
+            if len(s):
+                val = float(s.iloc[-1])
+                break
+        rows[label] = (val / 1e6) if val is not None else None
+    out = pd.DataFrame({"($mm)": rows})
+    return out.dropna(how="all"), None
+
+
 def coverage_report(df: pd.DataFrame, axes: dict) -> None:
     print("\nAxes declared in this instance:")
     all_axes = sorted({a for d in df["dims"] for a in d})
@@ -591,11 +770,19 @@ def coverage_report(df: pd.DataFrame, axes: dict) -> None:
 # ===========================================================================
 
 def run_aligned(args) -> int:
-    """--periods N: historical panels on the SAME grid as xbrl_panel.py."""
+    """Aligned historical panels on the SAME grid as xbrl_panel.py.
+
+    The window is anchored by --start (default FY2024Q2: the first period the
+    financial-statement panels carry). --periods N still selects the last N
+    quarters when no --start is given."""
+    start = (args.start or "").strip()
+    if not start and not args.periods:
+        start = "FY2024Q2"   # default first period to pull
     periods = build_period_grid(args.cik, args.user_agent, args.periods,
-                                args.companyfacts or None)
-    print(f"Aligned to panel periods: {periods[0].label} ({periods[0].end}) -> "
-          f"{periods[-1].label} ({periods[-1].end})")
+                                args.companyfacts or None, start_label=start or None)
+    anchor = f"start={start}" if start else f"last {args.periods}"
+    print(f"Aligned to panel periods ({anchor}): {periods[0].label} ({periods[0].end}) -> "
+          f"{periods[-1].label} ({periods[-1].end})  [{len(periods)} quarters]")
 
     # every end date the panel needs, INCLUDING the prior quarters a Q4
     # derivation reaches back into, so the fetch window covers them.
@@ -646,16 +833,57 @@ def run_aligned(args) -> int:
         print("\nNo product/platform axis found in the fetched instances "
               "(nothing to align for market platform).")
 
-    # Companion panels on the same grid.
-    seg = aligned_quarterly_revenue(facts, periods, axes.get("segment"), "Segment",
-                                    cons_axis=axes.get("consolidation"), operating_only=True)
-    if not seg.empty:
-        print("\n--- Revenue by reportable segment (quarterly, aligned) ---")
-        print(seg.to_string())
-        seg.to_csv(f"{args.outdir}/segment_revenue_quarterly_aligned.csv")
-        wrote += 1
+    # ---- Full segment disclosure (ASC 280 / ASU 2023-07), operating-segment
+    #      table: revenue, operating income, other-item amount, and D&A, each on
+    #      the aligned grid; plus the derived operating margin. ----
+    seg_axis, cons_axis = axes.get("segment"), axes.get("consolidation")
+    seg_panels: dict[str, pd.DataFrame] = {}
+    metric_titles = {
+        "revenue": "Revenue by reportable segment",
+        "operating_income": "Operating income by reportable segment",
+        "other_item": "Other item amount by reportable segment",
+        "dna": "Depreciation & amortization by reportable segment",
+    }
+    for key, concepts in SEGMENT_METRICS.items():
+        panel = aligned_quarterly_metric(facts, periods, seg_axis, metric_titles[key],
+                                         concepts=concepts, cons_axis=cons_axis,
+                                         operating_only=True)
+        seg_panels[key] = panel
+        if not panel.empty:
+            print(f"\n--- {metric_titles[key]} (quarterly, aligned) ---")
+            print(panel.to_string())
+            panel.to_csv(f"{args.outdir}/segment_{key}_quarterly_aligned.csv")
+            wrote += 1
 
-    geo = aligned_quarterly_revenue(facts, periods, axes.get("geography"), "Geography")
+    seg = seg_panels.get("revenue", pd.DataFrame())      # kept for the summary line
+    rev, oi = seg_panels.get("revenue"), seg_panels.get("operating_income")
+    if isinstance(rev, pd.DataFrame) and isinstance(oi, pd.DataFrame) \
+            and not rev.empty and not oi.empty:
+        common = oi.index.intersection(rev.index)
+        cols = oi.columns.intersection(rev.columns)
+        if len(common) and len(cols):
+            margin = (oi.loc[common, cols] / rev.loc[common, cols]).round(4)
+            margin.index.name = "Segment operating margin"
+            print("\n--- Operating margin by reportable segment (quarterly, aligned) ---")
+            print(margin.to_string())
+            margin.to_csv(f"{args.outdir}/segment_operating_margin_quarterly_aligned.csv")
+            wrote += 1
+
+    # ---- Reconciliation bridge: total segment operating income -> consolidated
+    #      income before tax (corporate unallocated costs + below-the-line). ----
+    recon = aligned_reconciliation(facts, periods, cons_axis)
+    if not recon.empty:
+        print("\n--- Reconciliation to consolidated pre-tax income (quarterly, aligned) ---")
+        print(recon.to_string())
+        recon.to_csv(f"{args.outdir}/segment_reconciliation_quarterly_aligned.csv")
+        wrote += 1
+        print("  [note] Corporate rows come from the consolidation-axis reconciling member; "
+              "interest / other / pre-tax rows come from the entity-wide default context "
+              "(the face-statement figures). The full ASU 2023-07 corporate breakout "
+              "(other-item amount, unallocated costs) is only tagged from FY2025 onward, so "
+              "earlier quarters may show blanks for those rows.")
+
+    geo = aligned_quarterly_metric(facts, periods, axes.get("geography"), "Geography")
     if not geo.empty:
         print("\n--- Revenue by geography (quarterly, aligned) ---")
         print(geo.to_string())
@@ -682,6 +910,10 @@ def main(argv=None) -> int:
     ap.add_argument("--periods", type=int, default=0,
                     help="ALIGNED MODE: build the last N fiscal quarters, matching "
                          "xbrl_panel.py --periods N, across multiple filing instances")
+    ap.add_argument("--start", default="",
+                    help="ALIGNED MODE: first fiscal quarter to pull, e.g. FY2024Q2 "
+                         "(the default when neither --start nor --periods is given). "
+                         "Overrides --periods when both are supplied.")
     ap.add_argument("--companyfacts", default="",
                     help="offline company-facts JSON, used only to build the aligned "
                          "period grid (skips the network for the grid)")
@@ -690,11 +922,13 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     os.makedirs(args.outdir, exist_ok=True)
 
-    # Aligned historical mode takes precedence when --periods is given.
-    if args.periods:
+    # Single-filing mode is selected by its own flags; otherwise aligned
+    # historical mode is the default (anchored at Q2 FY2024 unless overridden).
+    single_filing = bool(args.accession or args.latest or args.instance)
+    if not single_filing:
         return run_aligned(args)
 
-    # -------- single-filing mode (unchanged) --------
+    # -------- single-filing mode --------
     if args.instance:
         if not os.path.exists(args.instance):
             print(f"ERROR: no such file: {args.instance}\n"
@@ -756,6 +990,12 @@ def main(argv=None) -> int:
             print(plat.to_string())
             plat.to_csv(f"{args.outdir}/platform_{per}.csv")
             print(f"  [note] {note}")
+
+        recon, _ = reconciliation_analysis(facts, axes, per)
+        if not recon.empty:
+            print(f"\n--- Reconciliation to pre-tax income ---")
+            print(recon.to_string())
+            recon.to_csv(f"{args.outdir}/reconciliation_{per}.csv")
 
     facts.drop(columns=["dims"]).to_csv(f"{args.outdir}/dimensional_facts.csv", index=False)
     print(f"\nWrote outputs to {args.outdir}/")
