@@ -1,21 +1,25 @@
 #OTN Note: NVDA's Q1 2027 10-Q was issued on April 26, 2026: https://www.sec.gov/ix?doc=/Archives/edgar/data/0001045810/000104581026000052/nvda-20260426.htm#fact-identifier-340.
 #I documented XBRL tags for each financial state within the NVDA-BS.csv, NVDA-IS.csv.
 
+#!/usr/bin/env python3
 """
 xbrl_panel.py — Build a historical financial-statement panel from SEC XBRL
-company facts, driven by an FSLI -> XBRL tag mapping ("NVDA-BS") & ("NVDA-IS") CSV files.
+company facts, driven by an FSLI -> XBRL tag mapping ("bank panel") CSV.
 
 Inputs
 ------
-  NVDA-BS.csv   FSLI / XBRL Tag  (balance sheet, instant facts)
-  NVDA-IS.csv   FSLI / XBRL Tag  (income statement, duration facts)
+  bank_panel_-_<TICKER>-BS.csv    FSLI / XBRL Tag  (balance sheet, instant facts)
+  bank_panel_-_<TICKER>-IS.csv    FSLI / XBRL Tag  (income statement, duration facts)
+  bank_panel_-_<TICKER>-SCF.csv   FSLI / XBRL Tag  (cash flows, YTD-derived, optional)
 
 Output
 ------
   panel_balance_sheet.csv        FSLI rows x period columns
   panel_income_statement.csv     FSLI rows x period columns
+  panel_cash_flow.csv            FSLI rows x period columns (only if --scf given)
   check_results.csv              every integrity check, per period, pass/fail
   facts_long.csv                 tidy long-format fact table (for Sheets/BI)
+  tag_provenance.csv             which concept actually sourced each cell
 
 Integrity checks
 ----------------
@@ -33,28 +37,40 @@ Integrity checks
         SE(t-1) + NetIncome + OCI + StockIssuedNewIssues + ShareBasedComp
               - TaxWithholdingOnShareBasedComp - ShareRepurchases - Dividends
         == SE(t)
+  CF01  OperatingCF + InvestingCF + FinancingCF + FXEffect == Change in cash
+  CF02  BeginningCash + Change in cash == EndingCash          (cash rollforward)
+  CF03  EndingCash (SCF) == Cash on balance sheet             (cross-statement)
+  CF04  NetIncomeLoss (SCF) == NetIncomeLoss (income stmt)    (cross-statement)
+
+Notes on the cash flow statement
+--------------------------------
+  * 10-Q cash flow statements are filed YEAR-TO-DATE only (no native 3-month
+    column), so discrete quarters are derived by differencing consecutive YTD
+    figures within a fiscal year: Q1 = YTD(Q1); Qn = YTD(Qn) - YTD(Q(n-1));
+    Q4 = FY - YTD(Q3). This mirrors the discrete-quarter convention already used
+    for the income statement, so the three statements tie to one another.
+  * "Cash at beginning/end of period" are INSTANT balances, not flows. They are
+    read from the balance concept at the prior period-end and the current
+    period-end respectively (not differenced).
 
 Usage
 -----
   python xbrl_panel.py --cik 1045810 --ticker NVDA \
-      --bs "NVDA-BS.csv" --is "NVDA-IS.csv" \
-      --user-agent "abc@xyz.com" --periods 12 --outdir ./out
+      --bs "NVIDIA Financial Statement XBRL Tags - NVIDIA-BS.csv" --is "NVIDIA Financial Statement XBRL Tags - NVIDIA-IS.csv" --scf "NVIDIA Financial Statement XBRL Tags - NVIDIA-SCF (corrected).csv" \
+      --user-agent "Ozoemena Nnamadim ozoemena@otnnamadim.com" --periods 12 --outdir ./out
 
   # no network — exercise the check engine against a local fixture
-  python xbrl_panel.py --fixture fixture_companyfacts.json ...
+  python xbrl_panel.py --fixture fixture_companyfacts.json --bs ... --is ... --scf ...
 """
 
 from __future__ import annotations
 
 import argparse
-import gzip
 import json
 import os
 import re
 import sys
 import time
-import urllib.error
-import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -94,7 +110,7 @@ class MappedLine:
     concept: str         # "Assets"
     taxonomy: str        # "us-gaap"
     depth: int           # indentation level, from leading spaces
-    statement: str       # "BS" | "IS"
+    statement: str       # "BS" | "IS" | "SCF"
 
 
 def load_mapping(path: str, statement: str) -> list[MappedLine]:
@@ -119,8 +135,7 @@ def load_mapping(path: str, statement: str) -> list[MappedLine]:
         fsli = "" if fsli is None else str(fsli)
         tag = "" if tag is None else str(tag).strip()
         if not TAG_RE.match(tag):
-            # section headers, blank spacers, and the stray literal
-            # "Total Operating Expenses" placeholder are all skipped here
+            # section headers, blank spacers, and subtotal placeholders skipped
             continue
         depth = (len(fsli) - len(fsli.lstrip(" "))) // 5
         clean = fsli.strip().lstrip("-").strip()
@@ -140,8 +155,6 @@ def load_mapping(path: str, statement: str) -> list[MappedLine]:
     if not lines:
         raise ValueError(f"{path}: no valid XBRL tags found")
     if len(lines) < 5:
-        # a near-empty parse means the file shape changed, not that the
-        # statement is genuinely 4 lines long — surface it loudly
         print(f"WARNING: {path} yielded only {len(lines)} tagged lines; "
               f"check the file layout.", file=sys.stderr)
     return lines
@@ -151,10 +164,8 @@ def load_mapping(path: str, statement: str) -> list[MappedLine]:
 # 2. Tag fallback chains
 # ===========================================================================
 # A mapping sheet pins one tag per FSLI, but issuers migrate concepts across
-# years (NVIDIA moved off us-gaap:Revenues to the ASC 606 revenue concept, and
-# reports cost of revenue under either CostOfRevenue or CostOfGoodsAndServicesSold
-# depending on filing vintage). Without fallbacks, a panel silently shows blanks
-# for older or newer periods. Each primary concept maps to ordered alternates.
+# years. Without fallbacks, a panel silently shows blanks for older/newer
+# periods. Each primary concept maps to ordered alternates.
 
 FALLBACKS: dict[str, list[str]] = {
     "Revenues": [
@@ -182,6 +193,34 @@ FALLBACKS: dict[str, list[str]] = {
     "WeightedAverageNumberOfDilutedSharesOutstanding": [
         "WeightedAverageNumberOfDilutedSharesOutstandingBasicAndDiluted",
     ],
+
+    # --- Statement of cash flows -------------------------------------------
+    # Section subtotals: pre-2018 filings used the "...ContinuingOperations"
+    # variants before the discontinued-operations split was normalized.
+    "NetCashProvidedByUsedInOperatingActivities": [
+        "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+    ],
+    "NetCashProvidedByUsedInInvestingActivities": [
+        "NetCashProvidedByUsedInInvestingActivitiesContinuingOperations",
+    ],
+    "NetCashProvidedByUsedInFinancingActivities": [
+        "NetCashProvidedByUsedInFinancingActivitiesContinuingOperations",
+    ],
+    # ASU 2016-18 renamed the cash balance/change concepts to include
+    # restricted cash. Older periods report the pre-restatement names.
+    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents": [
+        "CashAndCashEquivalentsAtCarryingValue",
+    ],
+    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect": [
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseExcludingExchangeRateEffect",
+        "CashAndCashEquivalentsPeriodIncreaseDecrease",
+    ],
+    "PaymentsOfDividends": ["PaymentsOfDividendsCommonStock"],
+    "DepreciationDepletionAndAmortization": [
+        "DepreciationAmortizationAndAccretionNet",
+        "DepreciationAndAmortization",
+    ],
+    "GainLossOnInvestments": ["GainLossOnInvestmentsAndDerivativeInstruments"],
 }
 
 # Concepts needed for the equity rollforward that do not appear on either
@@ -224,36 +263,13 @@ def chain(concept: str) -> list[str]:
 # 3. SEC fetch
 # ===========================================================================
 
-def _get_json(url: str, headers: dict) -> tuple[int, dict | None]:
-    """One GET, returning (status_code, parsed_json_or_None).
-
-    Uses the stdlib so the script has no third-party HTTP dependency; if
-    requests happens to be installed it is used instead, purely for its
-    connection pooling on repeated runs.
-    """
-    if requests is not None:
-        r = requests.get(url, headers=headers, timeout=30)
-        return r.status_code, (r.json() if r.status_code == 200 else None)
-
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            raw = r.read()
-            # urllib does not transparently decompress
-            if r.headers.get("Content-Encoding") == "gzip":
-                raw = gzip.decompress(raw)
-            return r.status, json.loads(raw.decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        return e.code, None
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"network error reaching SEC: {e.reason}") from e
-
-
 def fetch_companyfacts(cik: int, user_agent: str, cache: str | None = None) -> dict:
-    """SEC requires a descriptive User-Agent and throttles at 10 req/sec."""
+    """SEC requires a descriptive User-Agent and throttles at ~10 req/sec."""
     if cache and os.path.exists(cache):
         with open(cache) as fh:
             return json.load(fh)
+    if requests is None:
+        raise RuntimeError("requests not installed; use --fixture for offline mode")
 
     url = SEC_COMPANYFACTS.format(cik=cik)
     headers = {
@@ -261,29 +277,21 @@ def fetch_companyfacts(cik: int, user_agent: str, cache: str | None = None) -> d
         "Accept-Encoding": "gzip, deflate",
         "Host": "data.sec.gov",
     }
-
-    status = None
     for attempt in range(4):
-        status, data = _get_json(url, headers)
-        if status == 200 and data is not None:
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
             if cache:
                 with open(cache, "w") as fh:
                     json.dump(data, fh)
             return data
-        if status == 404:
-            raise RuntimeError(
-                f"SEC returned 404 for CIK {cik:010d}. Check the CIK is correct "
-                f"and has XBRL filings (NVIDIA = 1045810)."
-            )
-        if status in (403, 429, 503):
+        if resp.status_code in (403, 429, 503):
             time.sleep(2 ** attempt)
             continue
-        raise RuntimeError(f"SEC returned {status}.")
-
+        resp.raise_for_status()
     raise RuntimeError(
-        f"SEC returned {status} after 4 attempts. If 403: --user-agent must be a "
-        f"descriptive contact string such as 'Jane Doe jane@firm.com'. If 429: your "
-        f"IP is rate-limited (10 req/sec, shared per IP); wait ~10 minutes."
+        f"SEC returned {resp.status_code}. A real contact string in --user-agent "
+        f"is mandatory; 403 almost always means the header was rejected."
     )
 
 
@@ -321,7 +329,12 @@ def _d(s: str | None) -> date | None:
 
 
 def index_facts(companyfacts: dict) -> dict[str, list[Fact]]:
-    """Flatten companyfacts JSON into {concept: [Fact, ...]}."""
+    """Flatten companyfacts JSON into {concept: [Fact, ...]}.
+
+    Keyed by concept name only, so company-extension concepts (e.g. the
+    ``nvda:`` tags on the cash flow statement) resolve by their local name
+    regardless of taxonomy prefix.
+    """
     out: dict[str, list[Fact]] = defaultdict(list)
     for taxonomy, concepts in companyfacts.get("facts", {}).items():
         for concept, payload in concepts.items():
@@ -397,11 +410,10 @@ YTD_DAYS = (350, 380)
 def quarterly_value(
     facts: dict[str, list[Fact]], concept: str, period: "Period"
 ) -> tuple[float | None, str | None]:
-    """Discrete-quarter value.
+    """Discrete-quarter value for INCOME-STATEMENT concepts.
 
     A natively reported ~90-day fact is used when present. Q4 is never filed on
-    a 10-Q, so it is derived as FY less the three prior quarters. This derivation
-    is the single most common source of error in hand-built quarterly models.
+    a 10-Q, so it is derived as FY less the three prior quarters.
     """
     v, used = duration_value(facts, concept, period.end, QTR_DAYS)
     if v is not None:
@@ -421,6 +433,91 @@ def quarterly_value(
     return None, None
 
 
+# ---------------------------------------------------------------------------
+# Cash-flow specific extraction
+# ---------------------------------------------------------------------------
+# Cash flow statements are filed year-to-date only. A discrete quarter is the
+# current cumulative figure minus the same fiscal year's prior-quarter
+# cumulative figure. The two "beginning/ending cash" lines are instant balances
+# and are handled separately (see build_panel / scf_line_role).
+
+CF_CUM_DAYS = (60, 380)  # Q1 YTD (~90d) through full fiscal year (~365d)
+
+# Canonical instant balance concept for beginning/ending cash on the SCF.
+BALANCE_CASH = "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"
+
+
+def cumulative_cashflow(
+    facts: dict[str, list[Fact]], concept: str, end: date
+) -> tuple[float | None, str | None]:
+    """As-filed cumulative (YTD or full-year) flow ending on ``end``.
+
+    Within one fiscal year there is exactly one cumulative duration per end
+    date; when several spans share the end date (e.g. a stray 3-month IS fact
+    also tagged under this concept) the widest span is the year-to-date figure.
+    """
+    for c in chain(concept):
+        hits = [
+            f
+            for f in facts.get(c, [])
+            if not f.is_instant
+            and f.end == end
+            and f.unit == "USD"
+            and CF_CUM_DAYS[0] <= (f.days or 0) <= CF_CUM_DAYS[1]
+        ]
+        if hits:
+            best = max(
+                hits,
+                key=lambda f: (f.days, -FORM_RANK.get(f.form, 2), f.filed.toordinal()),
+            )
+            return best.value, c
+    return None, None
+
+
+def cashflow_value(
+    facts: dict[str, list[Fact]], concept: str, period: "Period"
+) -> tuple[float | None, str | None]:
+    """Discrete-quarter cash-flow value via year-to-date differencing.
+
+        Q1: cumulative(Q1)                        (~1 quarter, nothing to net off)
+        Qn: cumulative(Qn) - cumulative(Q(n-1))   (Q2, Q3)
+        Q4: cumulative(FY) - cumulative(Q3)
+    """
+    cur, used = cumulative_cashflow(facts, concept, period.end)
+    if cur is None:
+        return None, None
+    if period.fytd_prior_end is None:
+        return cur, used  # Q1: cumulative == discrete
+    prior, _ = cumulative_cashflow(facts, concept, period.fytd_prior_end)
+    if prior is None:
+        return None, None  # cannot difference safely -> report as missing
+    return cur - prior, (used + " [derived discrete]") if used else None
+
+
+def scf_line_role(ln: "MappedLine") -> str:
+    """Classify an SCF mapping line into how its value must be sourced:
+
+        begin_cash  -> instant balance at the prior period-end
+        end_cash    -> instant balance at the current period-end
+        change_cash -> duration (net change in cash), YTD-differenced
+        flow        -> duration line item, YTD-differenced
+
+    The balance lines are detected from the FSLI label because the shipped
+    template mis-tags "beginning of period" with the change-in-cash concept.
+    """
+    f = ln.fsli.lower()
+    if "begin" in f:
+        return "begin_cash"
+    if "end of period" in f or f.endswith("at end") or " at end" in f:
+        return "end_cash"
+    c = ln.concept
+    if c.endswith("PeriodIncreaseDecreaseIncludingExchangeRateEffect") or \
+       c.endswith("PeriodIncreaseDecreaseExcludingExchangeRateEffect") or \
+       c == "CashAndCashEquivalentsPeriodIncreaseDecrease":
+        return "change_cash"
+    return "flow"
+
+
 # ===========================================================================
 # 5. Period scaffold
 # ===========================================================================
@@ -430,8 +527,9 @@ class Period:
     end: date
     fy: int
     fp: str                       # Q1 | Q2 | Q3 | Q4
-    prior_end: date | None = None
-    prior_q_ends: list[date] = field(default_factory=list)
+    prior_end: date | None = None          # immediately preceding period-end
+    prior_q_ends: list[date] = field(default_factory=list)  # same-FY quarters (Q4 use)
+    fytd_prior_end: date | None = None     # same-FY prior quarter-end (YTD differencing)
 
     @property
     def label(self) -> str:
@@ -459,10 +557,16 @@ def build_periods(facts: dict[str, list[Fact]], n: int) -> list[Period]:
         p = Period(end=e, fy=fy, fp=fp, prior_end=ends[i - 1] if i else None)
         periods.append(p)
 
-    # attach the three prior quarter-ends inside the same fiscal year for Q4 derivation
+    # three prior quarter-ends inside the same fiscal year (Q4 IS derivation)
     for i, p in enumerate(periods):
         if p.fp == "Q4":
             p.prior_q_ends = [q.end for q in periods[max(0, i - 3) : i]]
+
+    # immediately-preceding quarter-end WITHIN the same fiscal year, for
+    # year-to-date cash-flow differencing (None for the first quarter of a FY)
+    for i, p in enumerate(periods):
+        same_fy_prior = [q.end for q in periods[:i] if q.fy == p.fy and q.end < p.end]
+        p.fytd_prior_end = max(same_fy_prior) if same_fy_prior else None
 
     return periods[-n:] if n else periods
 
@@ -478,11 +582,20 @@ def build_panel(
     for ln in lines:
         row = {"FSLI": ln.raw_fsli or ln.fsli, "XBRL Tag": ln.tag}
         prow = dict(row)
+        role = scf_line_role(ln) if ln.statement == "SCF" else None
         for p in periods:
             if ln.statement == "BS":
                 v, used = instant_value(facts, ln.concept, p.end)
-            else:
+            elif ln.statement == "IS":
                 v, used = quarterly_value(facts, ln.concept, p)
+            else:  # SCF
+                if role == "begin_cash":
+                    v, used = (instant_value(facts, BALANCE_CASH, p.prior_end)
+                               if p.prior_end else (None, None))
+                elif role == "end_cash":
+                    v, used = instant_value(facts, BALANCE_CASH, p.end)
+                else:  # flow or change_cash
+                    v, used = cashflow_value(facts, ln.concept, p)
             row[p.label] = v
             prow[p.label] = used or ""
         rows.append(row)
@@ -491,12 +604,17 @@ def build_panel(
 
 
 def value_grid(facts: dict[str, list[Fact]], periods: list[Period], concepts: Iterable[str], kind: str) -> dict:
-    """{(concept, period_label): value} for the concepts the checks need."""
+    """{(concept, period_label): value} for the concepts the checks need.
+
+    kind: "instant" | "duration" (IS-style discrete) | "cashflow" (YTD-diff).
+    """
     grid: dict[tuple[str, str], float | None] = {}
     for c in concepts:
         for p in periods:
             if kind == "instant":
                 v, _ = instant_value(facts, c, p.end)
+            elif kind == "cashflow":
+                v, _ = cashflow_value(facts, c, p)
             else:
                 v, _ = quarterly_value(facts, c, p)
             grid[(c, p.label)] = v
@@ -512,12 +630,7 @@ SMALL_ABS_TOL = 0.01        # one cent
 
 
 def _ok(lhs: float, rhs: float) -> tuple[bool, float]:
-    """Pass if within EITHER the absolute or the relative band.
-
-    The absolute band is scale-aware: a $1MM tolerance is right for statement
-    totals but would make an EPS comparison ($2.94 vs $9.41) pass trivially, so
-    small-magnitude values fall back to a one-cent band.
-    """
+    """Pass if within EITHER the absolute or the relative band."""
     diff = lhs - rhs
     scale = max(abs(lhs), abs(rhs), 1.0)
     abs_tol = SMALL_ABS_TOL if scale < SMALL_MAGNITUDE else ABS_TOL
@@ -542,6 +655,8 @@ def run_checks(facts: dict[str, list[Fact]], periods: list[Period]) -> pd.DataFr
             "PreferredStockValueOutstanding", "AdditionalPaidInCapital",
             "AccumulatedOtherComprehensiveIncomeLossNetOfTax",
             "RetainedEarningsAccumulatedDeficit",
+            # cash flow ending/beginning balance concept
+            BALANCE_CASH,
         ],
         "instant",
     )
@@ -562,6 +677,20 @@ def run_checks(facts: dict[str, list[Fact]], periods: list[Period]) -> pd.DataFr
             "PaymentsForRepurchaseOfCommonStock", "PaymentsOfDividendsCommonStock",
         ],
         "duration",
+    )
+    # Discrete-quarter cash-flow figures (YTD-differenced) for the CF checks.
+    cf = value_grid(
+        facts,
+        periods,
+        [
+            "NetCashProvidedByUsedInOperatingActivities",
+            "NetCashProvidedByUsedInInvestingActivities",
+            "NetCashProvidedByUsedInFinancingActivities",
+            "EffectOfExchangeRateOnCashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect",
+            "NetIncomeLoss",
+        ],
+        "cashflow",
     )
 
     prior_se = {p.label: inst.get(("StockholdersEquity", pl.label)) if (pl := _prior(periods, p)) else None
@@ -584,6 +713,7 @@ def run_checks(facts: dict[str, list[Fact]], periods: list[Period]) -> pd.DataFr
         L = p.label
         g = lambda c: inst.get((c, L))
         d = lambda c: dur.get((c, L))
+        cfv = lambda c: cf.get((c, L))
 
         # --- Balance sheet ------------------------------------------------
         add("BS01", p, "Assets = Liabilities and Shareholders' Equity",
@@ -672,6 +802,47 @@ def run_checks(facts: dict[str, list[Fact]], periods: list[Period]) -> pd.DataFr
                 det += f" | untagged, treated as 0: {', '.join(missing)}"
             add("EQ01", p, "Shareholders' equity rollforward", roll, end_se, detail=det)
 
+        # --- Cash flow statement ------------------------------------------
+        op  = cfv("NetCashProvidedByUsedInOperatingActivities")
+        inv = cfv("NetCashProvidedByUsedInInvestingActivities")
+        fin = cfv("NetCashProvidedByUsedInFinancingActivities")
+        fx  = cfv("EffectOfExchangeRateOnCashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents")
+        chg = cfv("CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect")
+
+        # CF01: the three sections (plus any separately reported FX effect) sum
+        # to the net change in cash. FX is optional and defaults to 0.
+        add("CF01", p, "Operating + Investing + Financing (+FX) = Change in cash",
+            None if op is None or inv is None or fin is None
+            else op + inv + fin + _s(fx),
+            chg,
+            detail="FX effect treated as 0 when untagged" if fx is None else "")
+
+        # CF02: cash rollforward. Beginning cash = prior period-end balance;
+        # ending cash = current period-end balance.
+        end_cash = g(BALANCE_CASH)
+        beg_cash = instant_value(facts, BALANCE_CASH, p.prior_end)[0] if p.prior_end else None
+        if beg_cash is None or end_cash is None or chg is None:
+            add("CF02", p, "Beginning cash + Change in cash = Ending cash",
+                None, None,
+                detail="no prior-period cash balance (first period in panel)"
+                       if p.prior_end is None else "missing cash balance/change")
+        else:
+            add("CF02", p, "Beginning cash + Change in cash = Ending cash",
+                beg_cash + chg, end_cash,
+                detail=f"beg={beg_cash:,.0f} chg={chg:,.0f}")
+
+        # CF03: SCF ending cash ties to the balance-sheet cash line. The SCF
+        # balance includes restricted cash; the BS line may exclude it, so a
+        # small residual here usually means restricted cash, not an error.
+        bs_cash = g("CashAndCashEquivalentsAtCarryingValue")
+        add("CF03", p, "Ending cash (SCF) = Cash on balance sheet",
+            end_cash, bs_cash,
+            detail="SCF balance includes restricted cash; BS line may exclude it")
+
+        # CF04: net income reconciles across the income and cash flow statements.
+        add("CF04", p, "Net income (SCF) = Net income (income statement)",
+            cfv("NetIncomeLoss"), d("NetIncomeLoss"))
+
     df = pd.DataFrame(out)
     return df
 
@@ -687,9 +858,11 @@ def _prior(periods: list[Period], p: Period) -> Period | None:
 # 8. Long-format export (Sheets / BI friendly)
 # ===========================================================================
 
-def long_table(panel_bs: pd.DataFrame, panel_is: pd.DataFrame, periods: list[Period]) -> pd.DataFrame:
+def long_table(statements: list[tuple[str, pd.DataFrame]], periods: list[Period]) -> pd.DataFrame:
     frames = []
-    for stmt, df in (("Balance Sheet", panel_bs), ("Income Statement", panel_is)):
+    for stmt, df in statements:
+        if df is None or df.empty:
+            continue
         m = df.melt(id_vars=["FSLI", "XBRL Tag"], var_name="period", value_name="value")
         m["statement"] = stmt
         frames.append(m)
@@ -709,6 +882,7 @@ def main(argv=None) -> int:
     ap.add_argument("--ticker", default="NVDA")
     ap.add_argument("--bs", required=True, help="balance sheet mapping CSV")
     ap.add_argument("--is", dest="is_", required=True, help="income statement mapping CSV")
+    ap.add_argument("--scf", default="", help="cash flow statement mapping CSV (optional)")
     ap.add_argument("--user-agent", default="", help='required by SEC, e.g. "Jane Doe jane@firm.com"')
     ap.add_argument("--periods", type=int, default=12, help="most recent N quarters (0 = all)")
     ap.add_argument("--outdir", default="./out")
@@ -735,23 +909,47 @@ def main(argv=None) -> int:
 
     bs_lines = load_mapping(args.bs, "BS")
     is_lines = load_mapping(args.is_, "IS")
-    print(f"Mapping: {len(bs_lines)} BS lines, {len(is_lines)} IS lines")
+    scf_lines = load_mapping(args.scf, "SCF") if args.scf else []
+    msg = f"Mapping: {len(bs_lines)} BS lines, {len(is_lines)} IS lines"
+    if scf_lines:
+        msg += f", {len(scf_lines)} SCF lines"
+    print(msg)
 
     panel_bs, prov_bs = build_panel(facts, bs_lines, periods)
     panel_is, prov_is = build_panel(facts, is_lines, periods)
+    panel_scf, prov_scf = (build_panel(facts, scf_lines, periods)
+                           if scf_lines else (pd.DataFrame(), pd.DataFrame()))
     checks = run_checks(facts, periods)
 
+    written = []
     panel_bs.to_csv(f"{args.outdir}/panel_balance_sheet.csv", index=False)
+    written.append("panel_balance_sheet.csv")
     panel_is.to_csv(f"{args.outdir}/panel_income_statement.csv", index=False)
-    pd.concat([prov_bs.assign(statement="BS"), prov_is.assign(statement="IS")]).to_csv(
-        f"{args.outdir}/tag_provenance.csv", index=False)
+    written.append("panel_income_statement.csv")
+    if scf_lines:
+        panel_scf.to_csv(f"{args.outdir}/panel_cash_flow.csv", index=False)
+        written.append("panel_cash_flow.csv")
+
+    prov_frames = [prov_bs.assign(statement="BS"), prov_is.assign(statement="IS")]
+    if scf_lines:
+        prov_frames.append(prov_scf.assign(statement="SCF"))
+    pd.concat(prov_frames).to_csv(f"{args.outdir}/tag_provenance.csv", index=False)
+    written.append("tag_provenance.csv")
+
     checks.to_csv(f"{args.outdir}/check_results.csv", index=False)
-    long_table(panel_bs, panel_is, periods).to_csv(f"{args.outdir}/facts_long.csv", index=False)
+    written.append("check_results.csv")
+
+    statements = [("Balance Sheet", panel_bs), ("Income Statement", panel_is)]
+    if scf_lines:
+        statements.append(("Cash Flow", panel_scf))
+    long_table(statements, periods).to_csv(f"{args.outdir}/facts_long.csv", index=False)
+    written.append("facts_long.csv")
 
     # coverage
     pcols = [p.label for p in periods]
-    filled = panel_bs[pcols].notna().sum().sum() + panel_is[pcols].notna().sum().sum()
-    total = (len(panel_bs) + len(panel_is)) * len(pcols)
+    panels = [panel_bs, panel_is] + ([panel_scf] if scf_lines else [])
+    filled = sum(pnl[pcols].notna().sum().sum() for pnl in panels)
+    total = sum(len(pnl) for pnl in panels) * len(pcols)
     print(f"Coverage: {filled}/{total} cells populated ({filled/total:.0%})")
 
     n_fail = (checks.status == "FAIL").sum()
@@ -762,9 +960,9 @@ def main(argv=None) -> int:
         print("\n--- FAILURES ---")
         cols = ["check_id", "period", "check", "lhs", "rhs", "difference", "detail"]
         print(checks[checks.status == "FAIL"][cols].to_string(index=False))
-    print(f"\nWrote 5 files to {args.outdir}/")
+    print(f"\nWrote {len(written)} files to {args.outdir}/")
     return 1 if n_fail else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())"
+    sys.exit(main())
