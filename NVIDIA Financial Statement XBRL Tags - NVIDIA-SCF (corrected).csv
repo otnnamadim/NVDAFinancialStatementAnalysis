@@ -1,0 +1,40 @@
+,
+,
+FSLI,XBRL Tag
+,
+Cash flows from operating activities:,
+Net income,us-gaap:NetIncomeLoss
+Adjustments to reconcile net income to net cash provided by operating activities:,
+     - Stock-based compensation expense,us-gaap:ShareBasedCompensation
+     - Deferred income taxes,us-gaap:DeferredIncomeTaxExpenseBenefit
+     - Depreciation and amortization,us-gaap:DepreciationDepletionAndAmortization
+"     - (Gains) losses from equity securities, net",us-gaap:GainLossOnInvestments
+     - Other,us-gaap:OtherNoncashIncomeExpense
+"Changes in operating assets and liabilities, net of acquisitions:",
+     - Accounts receivable,us-gaap:IncreaseDecreaseInAccountsReceivable
+     - Inventories,us-gaap:IncreaseDecreaseInInventories
+     - Prepaid expenses and other assets,us-gaap:IncreaseDecreaseInPrepaidDeferredExpenseAndOtherAssets
+     - Accounts payable,us-gaap:IncreaseDecreaseInAccountsPayable
+     - Accrued and other current liabilities,us-gaap:IncreaseDecreaseInAccruedLiabilitiesAndOtherOperatingLiabilities
+     - Other long-term liabilities,us-gaap:IncreaseDecreaseInOtherNoncurrentLiabilities
+Net cash provided by operating activities,us-gaap:NetCashProvidedByUsedInOperatingActivities
+Cash flows from investing activities:,
+     - Proceeds from maturities of marketable debt securities,us-gaap:ProceedsFromMaturitiesPrepaymentsAndCallsOfAvailableForSaleSecurities
+     - Proceeds from sales of non-marketable securities,nvda:ProceedsFromSaleOfNonMarketableSecurities
+     - Proceeds from sales of marketable debt securities,us-gaap:ProceedsFromSaleOfAvailableForSaleSecuritiesDebt
+     - Purchases of non-marketable securities,nvda:PaymentsToAcquireNonMarketableSecurities
+     - Purchases of marketable debt and equity securities,nvda:PaymentsToAcquireMarketableDebtAndEquitySecurities
+     - Purchases related to property and equipment and intangible assets,us-gaap:PaymentsToAcquireProductiveAssets
+"     - Acquisitions, net of cash acquired",us-gaap:PaymentsToAcquireBusinessesNetOfCashAcquired
+Net cash used in investing activities,us-gaap:NetCashProvidedByUsedInInvestingActivities
+Cash flows from financing activities:,
+     - Proceeds related to emplovee stock plans,us-gaap:ProceedsFromStockPlans
+     - Paments related to repurchases of common stock,us-gaap:PaymentsForRepurchaseOfCommonStock
+     - Payments related to employee stock plan taxes,us-gaap:PaymentsRelatedToTaxWithholdingForShareBasedCompensation
+     - Dividends paid,us-gaap:PaymentsOfDividends
+     - Principal payments on property and equipment and intangible assets,nvda:PaymentsForFinancedPropertyPlantAndEquipmentAndIntangibleAssetsFinancingActivities
+     - Other,us-gaap:ProceedsFromPaymentsForOtherFinancingActivities
+Net cash used in financing activities,us-gaap:NetCashProvidedByUsedInFinancingActivities
+Change in cash and cash equivalents,us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect
+Cash and cash equivalents at beginning of period,us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents
+Cash and cash equivalents at end of period,us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents
