@@ -406,6 +406,26 @@ def duration_value(
 QTR_DAYS = (80, 100)
 YTD_DAYS = (350, 380)
 
+# Concepts that are NOT additive across quarters. Deriving fiscal Q4 as
+# FY - (Q1+Q2+Q3) is only valid for flows (revenue, expenses, income). Per-share
+# amounts, weighted-average share counts, and point-in-time ratios/rates do not
+# sum — subtracting them yields nonsense (e.g. a negative Q4 share count). For
+# these, Q4 is left blank unless a native ~90-day fact exists, because a genuine
+# discrete-quarter figure is simply not reported and cannot be reconstructed by
+# subtraction. (Q4 EPS, if needed, is derived-Q4 net income over a period-end
+# share count downstream — never by differencing EPS.)
+NON_ADDITIVE_RE = re.compile(
+    r"PerShare"
+    r"|WeightedAverageNumberOf\w*Shares"
+    r"|SharesOutstanding"
+    r"|Ratio|Percentage|EffectiveIncomeTaxRate",
+    re.IGNORECASE,
+)
+
+
+def _is_non_additive(concept: str) -> bool:
+    return bool(NON_ADDITIVE_RE.search(concept))
+
 
 def quarterly_value(
     facts: dict[str, list[Fact]], concept: str, period: "Period"
@@ -413,13 +433,18 @@ def quarterly_value(
     """Discrete-quarter value for INCOME-STATEMENT concepts.
 
     A natively reported ~90-day fact is used when present. Q4 is never filed on
-    a 10-Q, so it is derived as FY less the three prior quarters.
+    a 10-Q, so for additive flows it is derived as FY less the three prior
+    quarters. Non-additive concepts (per-share amounts, weighted-average share
+    counts, ratios) are never derived by subtraction — Q4 is left blank instead
+    of a meaningless artefact.
     """
     v, used = duration_value(facts, concept, period.end, QTR_DAYS)
     if v is not None:
         return v, used
 
     if period.fp == "Q4" and period.prior_q_ends:
+        if _is_non_additive(concept):
+            return None, None   # not additive: no valid Q4 by subtraction
         fy_val, used = duration_value(facts, concept, period.end, YTD_DAYS)
         if fy_val is None:
             return None, None
@@ -536,12 +561,61 @@ class Period:
         return f"FY{self.fy}{self.fp}"
 
 
+def _infer_fye_month(facts: dict[str, list[Fact]]) -> int:
+    """Infer the fiscal-year-end month from annual filings.
+
+    The month an issuer closes its fiscal year on is stable, so we take the
+    most common end month among annual (10-K / 20-F, or fp=='FY') Assets facts.
+    NVIDIA closes in late January -> 1. Falls back to the modal end month of all
+    Assets facts, then to December."""
+    from collections import Counter
+    annual_months = Counter()
+    all_months = Counter()
+    for f in facts.get("Assets", []):
+        if not (f.is_instant and f.unit == "USD"):
+            continue
+        all_months[f.end.month] += 1
+        if f.form.startswith(("10-K", "20-F")) or f.fp == "FY":
+            annual_months[f.end.month] += 1
+    if annual_months:
+        return annual_months.most_common(1)[0][0]
+    if all_months:
+        return all_months.most_common(1)[0][0]
+    return 12
+
+
+def _fiscal_label(end: date, fye_month: int) -> tuple[int, str]:
+    """Fiscal (year, quarter) for a period end date, from the fiscal calendar
+    alone — never from a filing's reported fy/fp, which can carry the context of
+    a later filing that references this date only as a prior-period comparative.
+
+    A period ending in or before the fiscal-year-end month belongs to that
+    fiscal year (its Q4); later months roll into the next fiscal year. The
+    quarter is the whole-quarter offset from the fiscal-year start."""
+    if end.month <= fye_month:
+        fy = end.year
+    else:
+        fy = end.year + 1
+    offset = (end.month - (fye_month + 1)) % 12   # months into the fiscal year
+    q = offset // 3 + 1
+    return fy, f"Q{q}"
+
+
 def build_periods(facts: dict[str, list[Fact]], n: int) -> list[Period]:
     """Derive the reporting calendar from Assets instant facts (present in
-    every filing) rather than assuming calendar quarter-ends."""
+    every filing) rather than assuming calendar quarter-ends.
+
+    Fiscal-year and quarter labels come from each period's END DATE via the
+    inferred fiscal-year-end month — NOT from the fact's own fy/fp fields. Those
+    fields reflect the *filing* that reported the value, so the most recent
+    annual balance (e.g. the fiscal Q4 that a later 10-Q carries as its
+    prior-year comparative) would otherwise inherit that 10-Q's fy/fp and be
+    mislabelled as the next Q1, colliding with the real Q1 of the new year."""
     assets = [f for f in facts.get("Assets", []) if f.is_instant and f.unit == "USD"]
     if not assets:
         raise RuntimeError("no us-gaap:Assets facts — cannot establish period grid")
+
+    fye_month = _infer_fye_month(facts)
 
     by_end: dict[date, Fact] = {}
     for f in sorted(assets, key=lambda x: x.filed):
@@ -550,10 +624,7 @@ def build_periods(facts: dict[str, list[Fact]], n: int) -> list[Period]:
     ends = sorted(by_end)
     periods: list[Period] = []
     for i, e in enumerate(ends):
-        f = by_end[e]
-        fp = f.fp or ("Q4" if f.form.startswith("10-K") else "Q?")
-        fp = "Q4" if fp == "FY" else fp
-        fy = f.fy or e.year
+        fy, fp = _fiscal_label(e, fye_month)
         p = Period(end=e, fy=fy, fp=fp, prior_end=ends[i - 1] if i else None)
         periods.append(p)
 
