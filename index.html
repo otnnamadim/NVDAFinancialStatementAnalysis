@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NVIDIA Segment, Margin &amp; Capital Analysis · FY2024 Q4 – FY2027 Q1 | Aperture Insights</title>
+<meta name="description" content="Interactive analysis of NVIDIA's revenue segmentation, gross and operating margins, operating expenses, and capital allocation from SEC EDGAR XBRL filings.">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+  :root {
+    --paper:#090d1a; --navy:#01032d; --panel:#11162b; --lavender:#ccc2f6;
+    --grey-1:#d9d9d9; --grey-2:#c6cbd1; --grey-4:#8a929b; --rule:#232c48; --warm:#d85a30;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--paper); color:var(--grey-4);
+    font-family:Georgia,"Times New Roman",serif; padding:40px 24px 64px; }
+  main { max-width:1080px; margin:0 auto; }
+  .eyebrow { font-family:"Helvetica Neue",Arial,sans-serif; font-size:12px; letter-spacing:.12em;
+    text-transform:uppercase; color:var(--grey-1); margin:0 0 8px; }
+  h1 { font-size:clamp(27px,4vw,34px); font-weight:400; line-height:1.25; color:var(--lavender);
+    margin:0 0 6px; letter-spacing:-.01em; }
+  .byline { font-family:"Helvetica Neue",Arial,sans-serif; font-size:13px; color:var(--grey-4); margin:0 0 20px; }
+  .byline a { color:var(--lavender); text-decoration:none; }
+  .intro { font-family:"Helvetica Neue",Arial,sans-serif; font-size:14.5px; color:var(--grey-2);
+    max-width:78ch; line-height:1.7; }
+  .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:26px 0 8px; padding:14px 0;
+    border-top:1px solid var(--rule); border-bottom:1px solid var(--rule);
+    position:sticky; top:0; background:var(--paper); z-index:5; }
+  .controls .label { font-family:"Helvetica Neue",Arial,sans-serif; font-size:11px; letter-spacing:.1em;
+    text-transform:uppercase; color:var(--grey-4); margin-right:4px; }
+  .freq-btn, .seg-chip { font-family:"Helvetica Neue",Arial,sans-serif; border:1px solid var(--rule);
+    background:none; border-radius:999px; padding:5px 13px; font-size:13px; cursor:pointer; color:var(--grey-2); }
+  .freq-btn[aria-pressed="true"] { background:var(--lavender); color:var(--navy); border-color:var(--lavender); font-weight:600; }
+  .seg-chip { display:inline-flex; align-items:center; gap:6px; }
+  .seg-chip::before { content:""; width:9px; height:9px; border-radius:50%; background:var(--c); }
+  .seg-chip[aria-pressed="false"] { opacity:.32; }
+  section { margin-top:12px; }
+  h2 { font-family:"Helvetica Neue",Arial,sans-serif; font-size:17px; font-weight:600; color:var(--lavender);
+    margin:44px 0 6px; padding-top:28px; border-top:1px solid var(--rule); }
+  .narrative { font-family:"Helvetica Neue",Arial,sans-serif; color:var(--grey-2); max-width:78ch;
+    margin:0 0 18px; font-size:13.5px; line-height:1.7; }
+  .chart-grid { display:grid; gap:20px; }
+  .chart-grid.cols-2 { grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
+  @media (max-width:860px){ .chart-grid.cols-2 { grid-template-columns:1fr; } }
+  .chart-block { margin:0; background:var(--panel); border:1px solid var(--rule); border-radius:10px; padding:16px 16px 10px; }
+  .chart-block figcaption { display:flex; align-items:baseline; justify-content:space-between; }
+  .chart-block h3 { font-family:"Helvetica Neue",Arial,sans-serif; font-size:14px; font-weight:600; color:var(--grey-1); margin:0 0 2px; }
+  .chart-block .unit { font-family:"Helvetica Neue",Arial,sans-serif; font-size:12px; color:var(--grey-4); }
+  .canvas-wrap { position:relative; height:300px; }
+  .canvas-wrap.tall { height:360px; }
+  .prelim-banner { font-family:"Helvetica Neue",Arial,sans-serif; border-left:3px solid var(--warm);
+    padding:10px 14px; margin:22px 0 0; background:rgba(216,90,48,.10); font-size:13px; color:#e9a488; line-height:1.6; }
+  .stat-row { display:flex; gap:30px; flex-wrap:wrap; margin:4px 0 18px; }
+  .stat { font-family:"Helvetica Neue",Arial,sans-serif; }
+  .stat .big { font-size:30px; font-weight:600; color:var(--lavender); letter-spacing:-.5px; }
+  .stat .lab { font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--grey-4); margin-top:2px; }
+  .stat .fine { font-size:11.5px; color:var(--grey-4); margin-top:2px; }
+  .commentary { font-family:"Helvetica Neue",Arial,sans-serif; margin:22px 0 0; padding:16px 18px; max-width:84ch;
+    background:var(--panel); border-left:3px solid var(--lavender); border-radius:0 8px 8px 0; }
+  .commentary h4 { font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--lavender); margin:0 0 10px; font-weight:600; }
+  .commentary p { color:var(--grey-2); font-size:13.5px; line-height:1.7; margin:0 0 10px; }
+  .commentary p:last-child { margin-bottom:0; }
+  .commentary strong { color:var(--grey-1); font-weight:600; }
+  .table-scroll { overflow-x:auto; }
+  table { font-family:"Helvetica Neue",Arial,sans-serif; border-collapse:collapse; width:100%; font-size:13px; margin-top:14px; }
+  th, td { text-align:right; padding:8px 10px; border-bottom:1px solid var(--rule); white-space:nowrap; }
+  th { font-size:11px; letter-spacing:.07em; text-transform:uppercase; color:var(--grey-4); font-weight:600; }
+  td { color:var(--grey-2); }
+  td.tick { text-align:left; font-weight:600; color:var(--grey-1); border-left:3px solid var(--lavender); }
+  .table-note { font-family:"Helvetica Neue",Arial,sans-serif; font-size:12px; color:var(--grey-4); max-width:84ch; line-height:1.65; margin:14px 0 0; }
+  footer { font-family:"Helvetica Neue",Arial,sans-serif; margin-top:52px; padding-top:20px; border-top:1px solid var(--rule);
+    font-size:12px; color:var(--grey-4); max-width:84ch; line-height:1.7; }
+  footer code { color:var(--grey-2); }
+</style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">SEC EDGAR · XBRL Company Facts · FY2024 Q4 – FY2027 Q1</p>
+  <h1>NVIDIA (NVDA): Segment Structure, Margin Profile, and Capital Allocation through Q1 FY2027</h1>
+  <p class="byline"><a href="https://www.otnnamadim.com">Aperture Insights</a> · Generated on July 29, 2026</p>
+  <p class="intro">NVIDIA is an accelerated-computing company. Its business resolves into a common set of functions &mdash; data-center compute and networking for AI training and inference, gaming graphics, professional visualization, automotive, and OEM. For most people these surface indirectly: the GPUs behind a chatbot, a game running at high frame rates, or a design workstation. This page summarizes historical trends in revenue composition, margins, operating efficiency, and capital allocation across the transition from NVIDIA&rsquo;s market-platform disclosure to its new data-center segmentation.</p>
+  <p class="intro" style="margin-top:14px">Every series below is derived from NVIDIA&rsquo;s SEC filings via the EDGAR XBRL company-facts and segment-note extracts &mdash; the same numbers management signed. NVIDIA reports on a fiscal year ending in late January, so <strong>FY2026 Q4 &asymp; January 2026</strong> and <strong>FY2027 Q1 &asymp; April 2026</strong>. Fiscal-Q4 figures are derived as the full year less the three prior quarters, consistent across all statements.</p>
+  <p class="prelim-banner">Two series are modeled, not as-reported, and are labeled as such throughout. <strong>Non-GAAP gross margin</strong> is estimated by adding back an assumed 12% COGS share of total stock-based compensation (the segment extract does not carry the non-GAAP reconciliation). <strong>Discrete-Q4 diluted EPS</strong> is computed as net income &divide; diluted weighted shares, because a stand-alone Q4 EPS is not filed and cannot be recovered by differencing annual EPS. The <strong>Q1 FY2027 segment redefinition</strong> (Data Center re-expressed as AICIE + Hyperscale, with Edge Computing as the reconciling line) is a reporting change, not an organic discontinuity.</p>
+
+  <div class="controls" role="group" aria-label="View filters">
+    <span class="label">Revenue mix</span>
+    <button class="freq-btn" data-mode="abs" aria-pressed="true">Absolute ($B)</button>
+    <button class="freq-btn" data-mode="pct" aria-pressed="false">Share (%)</button>
+    <span class="label" style="margin-left:12px">Segments</span>
+    <button class="seg-chip" data-seg="dc" style="--c:#86d1a0" aria-pressed="true">Data Center</button><button class="seg-chip" data-seg="edge" style="--c:#8aa9d6" aria-pressed="true">Edge Computing</button><button class="seg-chip" data-seg="gaming" style="--c:#ccc2f6" aria-pressed="true">Gaming</button><button class="seg-chip" data-seg="proviz" style="--c:#d99bce" aria-pressed="true">Pro Viz</button><button class="seg-chip" data-seg="auto" style="--c:#e5c06b" aria-pressed="true">Automotive</button><button class="seg-chip" data-seg="oem" style="--c:#aeb6c4" aria-pressed="true">OEM &amp; Other</button>
+  </div>
+
+  <section>
+    <h2>Revenue composition &amp; structural transition</h2>
+    <p class="narrative">Gross revenue reconciles exactly from segment components in both regimes. Through <strong>FY24 Q4 &ndash; FY26 Q4</strong> the five market platforms sum to the top line, with Data Center shown as Compute + Networking (&ldquo;Compute Data Center&rdquo;). At <strong>Q1 FY27</strong> the disclosure shifts: AICIE + Hyperscale re-form Data Center, and Edge Computing reconciles the remainder. Toggle to <em>Share (%)</em> to read mix rather than level.</p>
+    <div class="chart-grid">
+      <figure class="chart-block">
+        <figcaption><h3>Revenue by segment</h3><span class="unit" id="rev-unit">USD billions · stacked to gross revenue</span></figcaption>
+        <div class="canvas-wrap tall"><canvas id="revChart"></canvas></div>
+      </figure>
+    </div>
+    <div class="commentary"><h4>Commentary</h4>
+      <p>The period is a single story told in one line item: Data Center goes from <strong>$18.4B</strong> (83% of revenue) in FY24 Q4 to <strong>$75.2B</strong> (92%) in FY27 Q1, while Gaming, Professional Visualization, Automotive, and OEM together fall from ~17% of the mix to a rounding difference. The FY27 Q1 relabeling &mdash; AICIE ($37.4B) + Hyperscale ($37.9B) = Data Center ($75.2B), plus Edge Computing ($6.4B) &mdash; is a change in how one segment is cut, not a change in the business.</p>
+      <p><strong>Note on comparability.</strong> The pre- and post-transition members do not co-exist in any single quarter, so they occupy different columns by design. &ldquo;Compute Data Center&rdquo; is the ASC&nbsp;280 Compute&nbsp;+&nbsp;Networking view; AICIE / Hyperscale / Edge Computing are the ASC&nbsp;606 disaggregation. Reading the trajectory within a regime is more reliable than splicing a level across the FY27 Q1 boundary.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Panel A — Margin inflection points</h2>
+    <p class="narrative">Gross margin troughs at <strong>60.5%</strong> in FY26 Q1 on inventory / H20-related charges, then recovers to <strong>75.0%</strong> by FY26 Q4 and holds through the segment transition. Operating margin expands to a period high on scale; net margin in FY27 Q1 is lifted by non-operating equity gains and reads above the operating line.</p>
+    <div class="chart-grid cols-2">
+      <figure class="chart-block">
+        <figcaption><h3>Gross margin — GAAP vs non-GAAP (est.)</h3><span class="unit">% of revenue</span></figcaption>
+        <div class="canvas-wrap"><canvas id="gmChart"></canvas></div>
+      </figure>
+      <figure class="chart-block">
+        <figcaption><h3>Operating &amp; net margin</h3><span class="unit">% of revenue</span></figcaption>
+        <div class="canvas-wrap"><canvas id="omChart"></canvas></div>
+      </figure>
+    </div>
+    <div class="commentary"><h4>Commentary</h4>
+      <p>The gross-margin path is the clearest signal in the set: a sharp, identifiable dislocation in FY26 Q1 followed by a clean climb back to the mid-70s. Because the estimated non-GAAP line sits only ~30&ndash;50bps above GAAP, the two move together &mdash; the story is the recovery, not the GAAP/non-GAAP wedge.</p>
+      <p><strong>Read operating margin, not net.</strong> FY27 Q1 net margin (71.5%) exceeds operating margin (65.6%) because ~$15.9B of non-operating equity-security gains flow below the operating line. Operating margin is the truer efficiency read; it, not net income, reflects the scaling of the core business.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Panel B — Operating efficiency indicators</h2>
+    <p class="narrative">Operating expense steps up every quarter but grows far slower than revenue &mdash; the operating-leverage engine. The <strong>FY27 Q1</strong> step (R&amp;D $6.32B, +$0.81B QoQ) is the largest single-quarter build in the window, consistent with the engineering / overhead load accompanying the new-segment rollout.</p>
+    <div class="chart-grid cols-2">
+      <figure class="chart-block">
+        <figcaption><h3>Operating expense — R&amp;D + SG&amp;A</h3><span class="unit">USD billions</span></figcaption>
+        <div class="canvas-wrap"><canvas id="opexChart"></canvas></div>
+      </figure>
+      <figure class="chart-block">
+        <figcaption><h3>Total OpEx as % of revenue</h3><span class="unit">% of revenue</span></figcaption>
+        <div class="canvas-wrap"><canvas id="opexPctChart"></canvas></div>
+      </figure>
+    </div>
+    <div class="commentary"><h4>Commentary</h4>
+      <p>Total operating expense rises from <strong>$3.18B</strong> (FY24 Q4) to <strong>$7.62B</strong> (FY27 Q1) &mdash; a 2.4&times; increase &mdash; while revenue rose 3.7&times;. That gap is why operating expense as a share of revenue <em>falls</em> from ~14% to ~9% across the window even as the absolute build accelerates. R&amp;D carries essentially all of the growth; SG&amp;A is close to flat.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Panel C — Capital allocation &amp; liquidity</h2>
+    <div class="stat-row">
+      <div class="stat"><div class="big">$58.3B</div><div class="lab">Net income · FY27 Q1</div><div class="fine">incl. ~$15.9B non-operating gains</div></div>
+      <div class="stat"><div class="big">$2.39</div><div class="lab">Diluted EPS · FY27 Q1</div><div class="fine">computed: NI &divide; diluted shares</div></div>
+      <div class="stat"><div class="big">$48.6B</div><div class="lab">Free cash flow · FY27 Q1</div><div class="fine">OCF $50.3B &minus; CapEx $1.8B</div></div>
+      <div class="stat"><div class="big">$97.9B</div><div class="lab">Cumulative returns · window</div><div class="fine">buybacks + dividends</div></div>
+    </div>
+    <div class="chart-grid cols-2">
+      <figure class="chart-block">
+        <figcaption><h3>Free cash flow — OCF vs CapEx</h3><span class="unit">USD billions</span></figcaption>
+        <div class="canvas-wrap"><canvas id="fcfChart"></canvas></div>
+      </figure>
+      <figure class="chart-block">
+        <figcaption><h3>Shareholder returns — quarterly &amp; cumulative</h3><span class="unit">USD billions</span></figcaption>
+        <div class="canvas-wrap"><canvas id="capChart"></canvas></div>
+      </figure>
+    </div>
+    <div class="commentary"><h4>Commentary</h4>
+      <p>NVIDIA converts almost all operating cash into free cash flow &mdash; CapEx stays near <strong>$1&ndash;2B</strong> a quarter even as OCF scales past <strong>$50B</strong>, so free cash flow tracks operating cash closely (FY27 Q1 conversion ~96%). The capital-light model leaves the cash to accumulate and to fund returns.</p>
+      <p>Buybacks dominate the return mix; the dividend is a token <strong>~$0.24B</strong> per quarter. Repurchases are lumpy &mdash; a <strong>$19.3B</strong> FY27 Q1 quarter against <strong>$3.8B</strong> the quarter before &mdash; but the cumulative line is a steady climb to <strong>$97.9B</strong> returned over the ten quarters. Because buybacks shrink the share count, they support diluted EPS independent of net income.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Milestone snapshot</h2>
+    <p class="narrative">Selected line items at four milestone quarters spanning the transition. USD billions except margins (%) and EPS ($/share).</p>
+    <div class="table-scroll">
+    <table>
+      <thead><tr><th style="text-align:left">Metric</th><th>FY24 Q4</th><th>FY25 Q4</th><th>FY26 Q4</th><th>FY27 Q1</th></tr></thead>
+      <tbody>
+        <tr><td class="tick">Revenue</td><td>22.1</td><td>39.3</td><td>68.1</td><td>81.6</td></tr>
+        <tr><td class="tick">Gross margin (GAAP)</td><td>76.0%</td><td>73.0%</td><td>75.0%</td><td>74.9%</td></tr>
+        <tr><td class="tick">Operating margin</td><td>61.6%</td><td>61.1%</td><td>65.0%</td><td>65.6%</td></tr>
+        <tr><td class="tick">Net income</td><td>12.3</td><td>22.1</td><td>43.0</td><td>58.3</td></tr>
+        <tr><td class="tick">Diluted EPS ($)</td><td>0.49</td><td>0.89</td><td>1.76</td><td>2.39</td></tr>
+        <tr><td class="tick">Operating cash flow</td><td>11.5</td><td>16.6</td><td>36.2</td><td>50.3</td></tr>
+        <tr><td class="tick">Free cash flow</td><td>11.2</td><td>15.6</td><td>34.9</td><td>48.6</td></tr>
+        <tr><td class="tick">Shareholder returns</td><td>2.8</td><td>8.1</td><td>4.1</td><td>19.6</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p class="table-note">Diluted EPS for fiscal-Q4 quarters (FY24 Q4, FY25 Q4, FY26 Q4) is computed as net income &divide; diluted weighted shares; a stand-alone Q4 EPS is not filed on a 10-Q and is not derivable by differencing annual EPS. Shareholder returns = share repurchases + dividends paid in the quarter.</p>
+  </section>
+
+  <footer>Values derived from XBRL-tagged filings (10-K, 10-Q) and the segment note, retrieved via SEC EDGAR. Revenue components reconcile to reported gross revenue in each regime; the FY2027 Q1 segment members (AICIE, Hyperscale, Edge Computing) replace the prior market-platform members and are not summed with them. Non-GAAP gross margin and discrete-Q4 EPS are modeled as noted above and are not as-reported figures. Full series embedded below as <code>NVDA</code>. Not investment advice; this page illustrates financial-statement analysis from public filings.</footer>
+</main>
+
+<script>
+const NVDA = {
+  periods:["FY24 Q4","FY25 Q1","FY25 Q2","FY25 Q3","FY25 Q4","FY26 Q1","FY26 Q2","FY26 Q3","FY26 Q4","FY27 Q1"],
+  rev:[22103,26044,30040,35082,39331,44062,46743,57006,68127,81615],
+  seg:{
+    computeDC:[18404,22563,26272,30771,35580,39112,41096,51215,62314,null],
+    gaming:[2865,2647,2880,3279,2544,3763,4287,4265,3727,null],
+    proviz:[463,427,454,486,511,509,601,760,1321,null],
+    auto:[281,329,346,449,570,567,586,592,604,null],
+    oem:[90,78,88,97,126,111,173,174,161,null],
+    aicie:[null,null,null,null,null,null,null,null,null,37377],
+    hyper:[null,null,null,null,null,null,null,null,null,37869],
+    edge:[null,null,null,null,null,null,null,null,null,6369]
+  },
+  gmGaap:[75.97,78.35,75.15,74.56,73.03,60.52,72.42,73.41,75.00,74.93],
+  gmNonGaap:[76.51,78.82,75.61,74.98,73.43,60.93,72.84,73.76,75.28,75.22],
+  opMargin:[61.60,64.92,62.06,62.34,61.10,49.11,60.84,63.17,65.02,65.60],
+  netMargin:[55.59,57.14,55.26,55.04,56.17,42.61,56.53,55.98,63.06,71.46],
+  rd:[2466,2720,3090,3390,3714,3989,4291,4705,5512,6321],
+  sga:[710,777,842,897,975,1041,1122,1134,1282,1300],
+  ocf:[11499,15345,14488,17627,16629,27414,15365,23751,36188,50344],
+  capex:[254,369,977,813,1077,1227,1895,1636,1284,1757],
+  fcf:[11245,14976,13511,16814,15552,26187,13470,22115,34904,48587],
+  buyback:[2659,7740,7158,10997,7811,14095,9720,12456,3815,19312],
+  dividends:[99,98,246,245,245,244,244,244,242,243],
+  cumReturns:[2758,10596,18000,29242,37298,51637,61601,74301,78358,97913]
+};
+window.NVDA = NVDA;
+
+const C = { dc:"#86d1a0", aicie:"#6fc3d6", edge:"#8aa9d6", gaming:"#ccc2f6",
+            proviz:"#d99bce", auto:"#e5c06b", oem:"#aeb6c4", lav:"#ccc2f6", coral:"#e8998a" };
+const TICK="#8a929b", GRID="rgba(204,194,246,0.09)", TT_BG="#01032d", RULE="#232c48";
+Chart.defaults.color = TICK;
+Chart.defaults.font.family = '"Helvetica Neue", Arial, sans-serif';
+Chart.defaults.font.size = 11;
+const B = v => v==null ? null : v/1000;
+const axB = { ticks:{ color:TICK, callback:v=>"$"+v+"B" }, grid:{ color:GRID }, border:{ color:RULE } };
+const axPct = { ticks:{ color:TICK, callback:v=>v+"%" }, grid:{ color:GRID }, border:{ color:RULE } };
+const axCat = { ticks:{ color:TICK }, grid:{ display:false }, border:{ color:RULE } };
+const tt = { backgroundColor:TT_BG, borderColor:RULE, borderWidth:1, titleColor:"#d9d9d9", bodyColor:"#c6cbd1" };
+const legendBottom = { position:"bottom", labels:{ color:"#c6cbd1", boxWidth:11, usePointStyle:true, font:{size:11} } };
+const baseOpts = extra => Object.assign({
+  responsive:true, maintainAspectRatio:false, animation:false,
+  interaction:{ mode:"index", intersect:false },
+  plugins:{ legend:{ display:false }, tooltip:tt }
+}, extra);
+
+const SEG_GROUPS = {
+  dc:    [["computeDC","Compute Data Center",C.dc],["aicie","AICIE",C.aicie],["hyper","Hyperscale",C.dc]],
+  edge:  [["edge","Edge Computing",C.edge]],
+  gaming:[["gaming","Gaming",C.gaming]],
+  proviz:[["proviz","Professional Visualization",C.proviz]],
+  auto:  [["auto","Automotive",C.auto]],
+  oem:   [["oem","OEM & Other",C.oem]]
+};
+let revMode = "abs";
+const activeSeg = new Set(Object.keys(SEG_GROUPS));
+
+function revDatasets(){
+  const ds = [];
+  for (const g of Object.keys(SEG_GROUPS)){
+    if (!activeSeg.has(g)) continue;
+    for (const [key,label,color] of SEG_GROUPS[g]){
+      const raw = NVDA.seg[key];
+      const data = revMode==="abs"
+        ? raw.map(v=>B(v))
+        : raw.map((v,i)=> v==null?null:+(100*v/NVDA.rev[i]).toFixed(2));
+      ds.push({ label, data, backgroundColor:color, stack:"rev",
+                categoryPercentage:.72, barPercentage:.9, borderWidth:0 });
+    }
+  }
+  if (revMode==="abs"){
+    ds.push({ type:"line", label:"Gross revenue", data:NVDA.rev.map(B),
+      borderColor:"#d9d9d9", borderWidth:1.6, pointRadius:2.5,
+      pointBackgroundColor:"#d9d9d9", tension:.25, fill:false, order:-1 });
+  }
+  return ds;
+}
+const revChart = new Chart(document.getElementById("revChart"), {
+  type:"bar",
+  data:{ labels:NVDA.periods, datasets:revDatasets() },
+  options: baseOpts({
+    scales:{ x:{ stacked:true, ...axCat }, y:{ stacked:true, ...axB } },
+    plugins:{ legend:{ display:false }, tooltip:{ ...tt, callbacks:{
+      label:c=> `${c.dataset.label}: ` + (revMode==="abs" ? "$"+(c.parsed.y??0).toFixed(1)+"B" : (c.parsed.y??0).toFixed(1)+"%")
+    }}}
+  })
+});
+function refreshRev(){
+  revChart.data.datasets = revDatasets();
+  revChart.options.scales.y = Object.assign({ stacked:true }, revMode==="abs"?axB:axPct);
+  revChart.update("none");
+  document.getElementById("rev-unit").textContent =
+    revMode==="abs" ? "USD billions · stacked to gross revenue" : "share of gross revenue (%)";
+}
+document.querySelectorAll(".freq-btn").forEach(b=>b.addEventListener("click",()=>{
+  revMode=b.dataset.mode;
+  document.querySelectorAll(".freq-btn").forEach(x=>x.setAttribute("aria-pressed",String(x===b)));
+  refreshRev();
+}));
+document.querySelectorAll(".seg-chip").forEach(ch=>ch.addEventListener("click",()=>{
+  const s=ch.dataset.seg;
+  if (activeSeg.has(s) && activeSeg.size>1) activeSeg.delete(s); else activeSeg.add(s);
+  ch.setAttribute("aria-pressed",String(activeSeg.has(s)));
+  refreshRev();
+}));
+
+new Chart(document.getElementById("gmChart"), {
+  type:"line",
+  data:{ labels:NVDA.periods, datasets:[
+    { label:"GAAP", data:NVDA.gmGaap, borderColor:C.lav, backgroundColor:"rgba(204,194,246,.08)", borderWidth:2.4, tension:.3, pointRadius:2.5, fill:true },
+    { label:"Non-GAAP (est.)", data:NVDA.gmNonGaap, borderColor:C.dc, borderWidth:1.5, borderDash:[5,3], tension:.3, pointRadius:0, fill:false }
+  ]},
+  options: baseOpts({ scales:{ x:axCat, y:{ ...axPct, suggestedMin:55, suggestedMax:82 } },
+    plugins:{ legend:legendBottom, tooltip:{ ...tt, callbacks:{ label:c=>`${c.dataset.label}: ${c.parsed.y}%` } } } })
+});
+new Chart(document.getElementById("omChart"), {
+  type:"line",
+  data:{ labels:NVDA.periods, datasets:[
+    { label:"Operating margin", data:NVDA.opMargin, borderColor:C.aicie, borderWidth:2.2, tension:.3, pointRadius:2.5, fill:false },
+    { label:"Net margin", data:NVDA.netMargin, borderColor:C.proviz, borderWidth:1.6, tension:.3, pointRadius:2.5, fill:false }
+  ]},
+  options: baseOpts({ scales:{ x:axCat, y:{ ...axPct, suggestedMin:40, suggestedMax:75 } },
+    plugins:{ legend:legendBottom, tooltip:{ ...tt, callbacks:{ label:c=>`${c.dataset.label}: ${c.parsed.y}%` } } } })
+});
+
+new Chart(document.getElementById("opexChart"), {
+  type:"bar",
+  data:{ labels:NVDA.periods, datasets:[
+    { label:"R&D", data:NVDA.rd.map(B), backgroundColor:C.edge, stack:"ox", categoryPercentage:.7 },
+    { label:"SG&A", data:NVDA.sga.map(B), backgroundColor:C.oem, stack:"ox", categoryPercentage:.7 },
+    { type:"line", label:"Total OpEx", data:NVDA.rd.map((v,i)=>B(v+NVDA.sga[i])), borderColor:C.lav, borderWidth:1.8, stepped:true, pointRadius:0, fill:false }
+  ]},
+  options: baseOpts({ scales:{ x:{ stacked:true, ...axCat }, y:{ stacked:true, ...axB } },
+    plugins:{ legend:legendBottom, tooltip:{ ...tt, callbacks:{ label:c=>`${c.dataset.label}: $${(c.parsed.y??0).toFixed(2)}B` } } } })
+});
+new Chart(document.getElementById("opexPctChart"), {
+  type:"line",
+  data:{ labels:NVDA.periods, datasets:[
+    { label:"OpEx % of revenue", data:NVDA.rd.map((v,i)=>+(100*(v+NVDA.sga[i])/NVDA.rev[i]).toFixed(2)),
+      borderColor:C.auto, borderWidth:2.2, tension:.3, pointRadius:2.5, fill:true, backgroundColor:"rgba(229,192,107,.07)" }
+  ]},
+  options: baseOpts({ scales:{ x:axCat, y:{ ...axPct, suggestedMin:0, suggestedMax:16 } },
+    plugins:{ legend:{ display:false }, tooltip:{ ...tt, callbacks:{ label:c=>`${c.parsed.y}% of revenue` } } } })
+});
+
+new Chart(document.getElementById("fcfChart"), {
+  type:"bar",
+  data:{ labels:NVDA.periods, datasets:[
+    { label:"Operating cash flow", data:NVDA.ocf.map(B), backgroundColor:C.dc, categoryPercentage:.68, barPercentage:.9 },
+    { label:"Capital expenditure", data:NVDA.capex.map(B), backgroundColor:C.coral, categoryPercentage:.68, barPercentage:.9 },
+    { type:"line", label:"Free cash flow", data:NVDA.fcf.map(B), borderColor:C.lav, borderWidth:1.8, pointRadius:2.5, tension:.25, fill:false }
+  ]},
+  options: baseOpts({ scales:{ x:axCat, y:axB },
+    plugins:{ legend:legendBottom, tooltip:{ ...tt, callbacks:{ label:c=>`${c.dataset.label}: $${(c.parsed.y??0).toFixed(1)}B` } } } })
+});
+new Chart(document.getElementById("capChart"), {
+  type:"bar",
+  data:{ labels:NVDA.periods, datasets:[
+    { label:"Share repurchases", data:NVDA.buyback.map(B), backgroundColor:C.lav, stack:"ret", categoryPercentage:.68, yAxisID:"y" },
+    { label:"Dividends", data:NVDA.dividends.map(B), backgroundColor:C.auto, stack:"ret", categoryPercentage:.68, yAxisID:"y" },
+    { type:"line", label:"Cumulative returns", data:NVDA.cumReturns.map(B), borderColor:C.aicie, borderWidth:1.8, pointRadius:2.5, tension:.25, fill:false, yAxisID:"y1" }
+  ]},
+  options: baseOpts({ scales:{
+      x:{ stacked:true, ...axCat },
+      y:{ stacked:true, position:"left", ...axB },
+      y1:{ position:"right", grid:{ display:false }, border:{ color:RULE }, ticks:{ color:TICK, callback:v=>"$"+v+"B" } } },
+    plugins:{ legend:legendBottom, tooltip:{ ...tt, callbacks:{ label:c=>`${c.dataset.label}: $${(c.parsed.y??0).toFixed(1)}B` } } } })
+});
+</script>
+</body>
+</html>
