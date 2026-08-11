@@ -29,13 +29,10 @@ This project feeds into broader research interests in finance, supply chain, and
    cd NVDAFinancialStatementAnalysis
 
 2. Set up your SEC User-Agent header (required by SEC EDGAR API):
-
-```bash
-
+   ```bash
    # In your script/config file:
    headers = {'User-Agent': 'YourName contact@domain.com'}
 
 3. Run the analysis script:
-
-```bash
+   ```bash
    python main.py
