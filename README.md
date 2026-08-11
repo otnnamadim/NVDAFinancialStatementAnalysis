@@ -32,10 +32,10 @@ This project feeds into broader research interests in finance, supply chain, and
 
 ```bash
 
-# In your script/config file:
-headers = {'User-Agent': 'YourName contact@domain.com'}
+   # In your script/config file:
+   headers = {'User-Agent': 'YourName contact@domain.com'}
 
 3. Run the analysis script:
 
 ```bash
-python main.py
+   python main.py
