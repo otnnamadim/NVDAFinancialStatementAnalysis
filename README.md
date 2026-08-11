@@ -1,5 +1,7 @@
 # NVIDIA ($NVDA) Financial Statement & Segment Analysis
 
+HTML Link: https://otnnamadim.github.io/NVDAFinancialStatementAnalysis/
+
 ## Overview & Accounting Relevance
 
 NVIDIA is one of the most popular companies in the world currently, and it sits at the center of the semiconductor supply chain and artificial intelligence infrastructure. My goal in building this dashboard was to illustrate the financials in a simplified manner to  better understand how its business model functions and to summarize the key financial results over time. This project constructs an automated data extraction and transformation pipeline to disaggregate NVIDIA's revenue models across geographic markets and operating segments (e.g., Data Center, Gaming, Professional Visualization).
