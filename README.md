@@ -32,8 +32,7 @@ This project feeds into broader research interests in finance, supply chain, and
 
 2. Set up your SEC User-Agent header (required by SEC EDGAR API):
    ```bash
-   # In your script/config file:
-   headers = {'User-Agent': 'YourName contact@domain.com'}
+   'User-Agent': 'YourName contact@domain.com'
 
 3. Run the analysis script:
    ```bash
